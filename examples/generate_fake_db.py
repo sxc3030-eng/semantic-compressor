@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SEED: Final[int] = 42
 DEFAULT_N_ROWS: Final[int] = 10_000
-DEFAULT_OUTPUT: Final[Path] = Path(r"D:\semantic-compressor\data\original\users.csv")
+DEFAULT_OUTPUT: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "data" / "original" / "users.csv"
+)
 
 # Bornes temporelles fixees pour la reproductibilite (la "vue actuelle" du dataset
 # est figee a la date de la spec, sinon "now" rendrait la sortie non-deterministe).

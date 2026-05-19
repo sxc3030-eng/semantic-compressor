@@ -17,6 +17,8 @@ from src.anchor_extractor import (
 )
 from src.models import ColumnProfile, ColumnType, Pattern, PatternType
 
+USERS_CSV = Path(__file__).parent.parent / "data" / "original" / "users.csv"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -203,13 +205,15 @@ _PROFILER_AVAILABLE = importlib.util.find_spec("src.profiler") is not None
     not _PROFILER_AVAILABLE,
     reason="src.profiler not yet implemented (run when available)",
 )
+@pytest.mark.skipif(
+    not USERS_CSV.exists(),
+    reason=f"Test fixture missing: {USERS_CSV} (data/ is gitignored, regenerate via examples/)",
+)
 def test_real_users_csv_anchors_with_profiler(tmp_path: Path) -> None:
     """End-to-end test using the real profiler."""
     from src.profiler import profile_dataframe  # type: ignore[import-not-found]
 
-    csv_path = Path(__file__).resolve().parent.parent / "data" / "original" / "users.csv"
-    assert csv_path.exists(), f"Test fixture missing: {csv_path}"
-
+    csv_path = USERS_CSV
     df = pd.read_csv(csv_path)
     profiles = profile_dataframe(df)
 
@@ -237,13 +241,15 @@ def test_real_users_csv_anchors_with_profiler(tmp_path: Path) -> None:
     assert savings["compression_ratio"] >= 1.5
 
 
+@pytest.mark.skipif(
+    not USERS_CSV.exists(),
+    reason=f"Test fixture missing: {USERS_CSV} (data/ is gitignored, regenerate via examples/)",
+)
 def test_real_users_csv_anchors_manual_profiles(tmp_path: Path) -> None:
     """Same end-to-end shape as test 7 but with hand-crafted profiles, so the
     test runs even when src.profiler doesn't exist yet (parallel agent
     dependency). Verifies the anchor extractor logic on real data."""
-    csv_path = Path(__file__).resolve().parent.parent / "data" / "original" / "users.csv"
-    assert csv_path.exists(), f"Test fixture missing: {csv_path}"
-
+    csv_path = USERS_CSV
     df = pd.read_csv(csv_path)
 
     # Hand-crafted profiles matching the known shape of users.csv (10k rows,

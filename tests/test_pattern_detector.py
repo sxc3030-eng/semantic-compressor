@@ -31,7 +31,7 @@ from src.pattern_detector import (
 # sur les ISO timestamps avec offset numerique (+0000) ; on prefere les masquer en test.
 warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
 
-USERS_CSV = Path(__file__).resolve().parent.parent / "data" / "original" / "users.csv"
+USERS_CSV = Path(__file__).parent.parent / "data" / "original" / "users.csv"
 
 
 # ---------------------------------------------------------------------------

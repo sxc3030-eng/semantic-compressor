@@ -41,7 +41,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SEED: Final[int] = 42
 DEFAULT_N_ROWS: Final[int] = 10_000
-DEFAULT_OUTPUT: Final[Path] = Path(r"D:\semantic-compressor\data\original\orders.csv")
+DEFAULT_OUTPUT: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "data" / "original" / "orders.csv"
+)
 
 # Bornes temporelles fixees pour la reproductibilite.
 DATA_NOW: Final[datetime] = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
