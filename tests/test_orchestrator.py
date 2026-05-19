@@ -78,7 +78,12 @@ def test_compress_creates_outputs(users_csv: Path, tmp_path: Path) -> None:
 
 
 def test_compress_returns_result_with_metrics(compress_result: CompressionResult) -> None:
-    """CompressionResult doit exposer toutes les metriques avec des valeurs coherentes."""
+    """CompressionResult doit exposer toutes les metriques avec des valeurs coherentes.
+
+    Note : depuis l'ajout du pattern type RANDOM_FORMAT, `password_hash` est
+    auto-detecte comme bcrypt et n'est plus marque ancre. Les ancres se limitent
+    a `id` et `email`.
+    """
     r = compress_result
 
     # Tailles strictement positives
@@ -94,11 +99,13 @@ def test_compress_returns_result_with_metrics(compress_result: CompressionResult
     # Counts
     assert r.n_rows == 10_000
     assert r.n_columns == 9
-    assert r.n_patterns == 9  # un pattern par colonne (ANCHOR_DIRECT pour les 3 ancres)
+    assert r.n_patterns == 9  # un pattern par colonne (ANCHOR_DIRECT pour id/email, RANDOM_FORMAT pour password_hash)
     assert r.elapsed_seconds > 0
 
-    # Ancres : minimum les 3 colonnes uniques
-    assert set(r.anchor_columns) >= {"id", "email", "password_hash"}
+    # Ancres : id et email restent ancres ; password_hash est RANDOM_FORMAT
+    # (bcrypt detecte automatiquement) donc PAS dans les ancres.
+    assert set(r.anchor_columns) >= {"id", "email"}
+    assert "password_hash" not in r.anchor_columns
 
 
 # ---------------------------------------------------------------------------
@@ -238,3 +245,60 @@ def test_compress_with_snappy_codec_works(users_csv: Path, tmp_path: Path) -> No
         for c in range(rg.num_columns):
             codecs_found.add(rg.column(c).compression.lower())
     assert "snappy" in codecs_found
+
+
+# ---------------------------------------------------------------------------
+# 8. RANDOM_FORMAT integration : ratio + fidelite ameliorees pour password_hash
+# ---------------------------------------------------------------------------
+
+
+def test_compress_with_random_format_password_hash(users_csv: Path, tmp_path: Path) -> None:
+    """Avec password_hash en RANDOM_FORMAT, le ratio doit etre >= 5:1 et la
+    fidelite >= 95.
+
+    C'est le critere d'acceptation du POC suite a l'ajout du pattern type
+    RANDOM_FORMAT : on n'a plus besoin de stocker les hashes (entropie max),
+    seul leur format est ecrit dans la recette.
+    """
+    from src.orchestrator import _extract_random_format_columns_from_recipe
+    from src.reconstructor import parse_recipe
+
+    result = compress(
+        users_csv,
+        tmp_path,
+        table_name="users",
+        manual_random_format_columns=["password_hash"],
+    )
+
+    # password_hash exclu des ancres.
+    assert "password_hash" not in result.anchor_columns
+
+    # Ratio >= 5:1 (objectif POC).
+    assert result.compression_ratio >= 5.0, (
+        f"Expected compression ratio >= 5.0 with RANDOM_FORMAT password_hash, "
+        f"got {result.compression_ratio:.2f}"
+    )
+
+    # Reconstruction + validation.
+    reconstructed_csv = tmp_path / "reconstructed.csv"
+    decompress(recipe_path=result.recipe_path, output_csv=reconstructed_csv)
+
+    # Pour la validation, on extrait le random_format mapping depuis la recette.
+    recipe = parse_recipe(result.recipe_path)
+    random_format_map = _extract_random_format_columns_from_recipe(recipe)
+    assert "password_hash" in random_format_map, (
+        f"Expected password_hash in random_format mapping, got {random_format_map.keys()}"
+    )
+
+    bundle = validate_pair(
+        original_csv=users_csv,
+        reconstructed_csv=reconstructed_csv,
+        anchor_columns=result.anchor_columns,
+        random_format_columns=random_format_map,
+    )
+
+    assert bundle.report.overall_score >= 95.0, (
+        f"Expected fidelity >= 95 with RANDOM_FORMAT password_hash, got "
+        f"{bundle.report.overall_score:.2f} "
+        f"(passed={bundle.report.passed_count}, failed={bundle.report.failed_count})"
+    )

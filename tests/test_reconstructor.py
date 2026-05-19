@@ -554,3 +554,127 @@ def test_full_pipeline_validation_score_high(tmp_path: Path) -> None:
         f"validation score too low: {report.overall_score} "
         f"(passed={report.passed_count}, failed={report.failed_count})"
     )
+
+
+# ---------------------------------------------------------------------------
+# RANDOM_FORMAT generation tests
+# ---------------------------------------------------------------------------
+
+
+def test_random_format_generates_valid_bcrypt() -> None:
+    """Un pattern RANDOM_FORMAT avec format_spec bcrypt produit des valeurs uniques
+    et toutes conformes au regex.
+    """
+    from src.reconstructor import generate_random_format_value
+
+    format_spec = {
+        "prefix": "$bcrypt$2b$12$",
+        "suffix": "$",
+        "body_type": "hex",
+        "body_length": 64,
+        "regex": r"^\$bcrypt\$2b\$12\$[0-9a-f]{64}\$$",
+    }
+
+    import re
+
+    pat = re.compile(format_spec["regex"])
+
+    values: list[str] = []
+    for i in range(100):
+        # Seed varie pour avoir des valeurs differentes ; meme seed -> meme valeur
+        # (reproductibilite garantie ailleurs).
+        rng = np.random.default_rng(seed=i)
+        v = generate_random_format_value(rng, format_spec)
+        values.append(v)
+        assert pat.match(v), f"Generated value {v!r} does not match regex {format_spec['regex']!r}"
+
+    # Toutes uniques (collision sur 64 hex chars est negligeable).
+    assert len(set(values)) == 100, (
+        f"Expected 100 unique values, got {len(set(values))} unique out of {len(values)}"
+    )
+
+    # Verifie la reproductibilite : meme seed -> meme valeur.
+    rng_a = np.random.default_rng(seed=42)
+    rng_b = np.random.default_rng(seed=42)
+    assert generate_random_format_value(rng_a, format_spec) == generate_random_format_value(
+        rng_b, format_spec
+    )
+
+
+def test_random_format_uuid_v4_generation() -> None:
+    """body_type='uuid_v4' produit un UUID syntaxiquement valide (version 4)."""
+    from src.reconstructor import generate_random_format_value
+
+    format_spec = {
+        "prefix": "",
+        "suffix": "",
+        "body_type": "uuid_v4",
+        "body_length": 36,
+        "regex": r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    }
+    import re
+
+    pat = re.compile(format_spec["regex"])
+
+    for i in range(20):
+        rng = np.random.default_rng(seed=i)
+        v = generate_random_format_value(rng, format_spec)
+        assert pat.match(v), f"Generated UUID {v!r} does not match v4 regex"
+
+
+def test_reconstruct_with_random_format_pattern() -> None:
+    """Pattern RANDOM_FORMAT integre dans la pipeline `reconstruct` : valeurs
+    toutes uniques et conformes a la regex pour chaque ligne."""
+    n = 50
+    anchors = pd.DataFrame({"id": [f"u{i:04d}" for i in range(n)]})
+
+    bcrypt_spec = {
+        "prefix": "$bcrypt$2b$12$",
+        "suffix": "$",
+        "body_type": "hex",
+        "body_length": 64,
+        "regex": r"^\$bcrypt\$2b\$12\$[0-9a-f]{64}\$$",
+    }
+
+    recipe = Recipe(
+        metadata=RecipeMetadata(
+            table_name="test", n_rows=n, original_size_bytes=100,
+            anchor_size_bytes=50, compression_ratio=2.0,
+        ),
+        schema_columns=[
+            ColumnProfile(
+                name="id", column_type=ColumnType.STRING, dtype="object",
+                n_total=n, n_unique=n, n_null=0, is_anchor_candidate=True,
+            ),
+            ColumnProfile(
+                name="password_hash", column_type=ColumnType.STRING, dtype="object",
+                n_total=n, n_unique=n, n_null=0, is_anchor_candidate=False,
+            ),
+        ],
+        anchor_columns=["id"],
+        anchor_file="x.parquet",
+        patterns=[
+            Pattern(column="id", pattern_type=PatternType.ANCHOR_DIRECT, fidelity_estimate=1.0),
+            Pattern(
+                column="password_hash",
+                pattern_type=PatternType.RANDOM_FORMAT,
+                format_spec=bcrypt_spec,
+                fidelity_estimate=1.0,
+            ),
+        ],
+    )
+
+    df = reconstruct(recipe, anchors)
+    assert len(df) == n
+    assert list(df.columns) == ["id", "password_hash"]
+
+    # Reconstruction reproductible (le seed de la ligne depend de l'id).
+    df2 = reconstruct(recipe, anchors)
+    pd.testing.assert_frame_equal(df, df2)
+
+    # Toutes valeurs conformes au regex et uniques.
+    import re
+    pat = re.compile(bcrypt_spec["regex"])
+    for v in df["password_hash"]:
+        assert pat.match(v), f"Generated value {v!r} does not match regex"
+    assert df["password_hash"].nunique() == n

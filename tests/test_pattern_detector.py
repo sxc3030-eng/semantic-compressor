@@ -248,7 +248,12 @@ def test_detect_correlation_cat_cat_on_real_users():
 
 
 def test_build_patterns_on_real_users():
-    """build_patterns sur users.csv : 9 patterns, ancres correctes, distributions correctes."""
+    """build_patterns sur users.csv : 9 patterns, ancres correctes, distributions correctes.
+
+    Note : `password_hash` est auto-detecte comme RANDOM_FORMAT (bcrypt) par
+    `build_patterns` depuis l'ajout du pattern type RANDOM_FORMAT. `id` et
+    `email` restent ANCHOR_DIRECT.
+    """
     df = pd.read_csv(USERS_CSV)
     profiles = _users_profiles(df)
     anchors = ["id", "email", "password_hash"]
@@ -260,11 +265,19 @@ def test_build_patterns_on_real_users():
     assert len(patterns) == 9, f"Expected 9 patterns, got {len(patterns)}"
     assert set(by_col.keys()) == set(df.columns)
 
-    # Ancres
-    for anchor in anchors:
+    # Ancres : id et email restent ANCHOR_DIRECT. password_hash est
+    # automatiquement detecte comme RANDOM_FORMAT (bcrypt-like).
+    for anchor in ("id", "email"):
         assert by_col[anchor].pattern_type == PatternType.ANCHOR_DIRECT, (
             f"{anchor} should be ANCHOR_DIRECT, got {by_col[anchor].pattern_type}"
         )
+    assert by_col["password_hash"].pattern_type == PatternType.RANDOM_FORMAT, (
+        f"password_hash should be RANDOM_FORMAT (bcrypt auto-detected), "
+        f"got {by_col['password_hash'].pattern_type}"
+    )
+    assert by_col["password_hash"].format_spec is not None
+    assert by_col["password_hash"].format_spec["body_type"] == "hex"
+    assert by_col["password_hash"].format_spec["body_length"] == 64
 
     # country et signup_source : l'un des deux doit etre CONDITIONAL_DISTRIBUTION
     # (l'ordre depend de la cardinalite mais ils sont lies). Le cas typique :
@@ -346,3 +359,52 @@ def test_conditional_distribution_categorical_pivot():
     for bucket in buckets:
         assert "bucket_value" in bucket
         assert "frequencies" in bucket
+
+
+# ---------------------------------------------------------------------------
+# RANDOM_FORMAT detection tests
+# ---------------------------------------------------------------------------
+
+
+def test_detect_bcrypt_format():
+    """Une serie de 100 valeurs bcrypt-like doit etre detectee comme RANDOM_FORMAT."""
+    from src.pattern_detector import detect_random_format
+
+    rng = np.random.default_rng(0)
+    # Genere 100 valeurs bcrypt-formed avec hex bodies de longueur 64.
+    values = []
+    for _ in range(100):
+        body = "".join(rng.choice(list("0123456789abcdef"), size=64).tolist())
+        values.append(f"$bcrypt$2b$12${body}$")
+    series = pd.Series(values, name="password_hash")
+
+    spec = detect_random_format(series)
+    assert spec is not None, "Expected bcrypt format to be detected"
+    assert spec["body_type"] == "hex"
+    assert spec["body_length"] == 64
+    assert spec["prefix"] == "$bcrypt$2b$12$"
+    assert spec["suffix"] == "$"
+    # Le regex doit matcher au moins une des valeurs.
+    import re
+
+    pat = re.compile(spec["regex"])
+    assert pat.match(values[0]), f"Regex {spec['regex']!r} should match {values[0]!r}"
+
+
+def test_random_format_uuid_not_auto():
+    """Une serie d'UUIDs ne doit PAS etre detectee comme RANDOM_FORMAT par defaut.
+
+    UUID est volontairement absent de KNOWN_RANDOM_FORMATS : `id` (UUID dans
+    users.csv) doit rester ancre direct, pas regenere.
+    """
+    from src.pattern_detector import detect_random_format
+    import uuid
+
+    values = [str(uuid.uuid4()) for _ in range(100)]
+    series = pd.Series(values, name="id")
+
+    spec = detect_random_format(series)
+    assert spec is None, (
+        f"UUID should NOT be auto-detected as RANDOM_FORMAT (would break "
+        f"anchor preservation for `id` column). Got spec={spec}"
+    )

@@ -29,10 +29,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.orchestrator import (  # noqa: E402  (sys.path injection avant import)
+    _extract_random_format_columns_from_recipe,
     compress,
     decompress,
     validate_pair,
 )
+from src.reconstructor import parse_recipe  # noqa: E402
 from src.validator import print_report  # noqa: E402
 from rich.console import Console  # noqa: E402
 from rich.panel import Panel  # noqa: E402
@@ -108,10 +110,24 @@ def parse_args() -> argparse.Namespace:
         help="Niveau de compression (zstd: 1-22, default: 22).",
     )
     p.add_argument(
+        "--random-format", type=str, default=None,
+        help=(
+            "Liste de colonnes a forcer en RANDOM_FORMAT (valeur non preservee, "
+            "regeneree depuis un format spec). Typique : password_hash. "
+            "Format : virgules (ex: --random-format password_hash,other_col)."
+        ),
+    )
+    p.add_argument(
         "--verbose", action="store_true",
         help="Logging niveau DEBUG.",
     )
     return p.parse_args()
+
+
+def _parse_csv_list(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    return [v.strip() for v in value.split(",") if v.strip()]
 
 
 def main() -> int:
@@ -136,10 +152,12 @@ def main() -> int:
 
     # 1. COMPRESS
     console.print("\n[bold]Step 1 / 3 : compress[/bold]")
+    random_format = _parse_csv_list(args.random_format)
     cresult = compress(
         input_csv=args.input,
         output_dir=args.output_dir,
         manual_anchor_columns=None,
+        manual_random_format_columns=random_format,
         parquet_codec=args.codec,
         parquet_compression_level=args.level,
         generate_html_profile=False,
@@ -159,10 +177,15 @@ def main() -> int:
 
     # 3. VALIDATE
     console.print("\n[bold]Step 3 / 3 : validate[/bold]")
+    # Pour les colonnes RANDOM_FORMAT, on extrait leur regex depuis la recette
+    # pour le validator.
+    recipe = parse_recipe(cresult.recipe_path)
+    random_format_map = _extract_random_format_columns_from_recipe(recipe)
     vresult = validate_pair(
         original_csv=args.input,
         reconstructed_csv=args.reconstructed_csv,
         anchor_columns=cresult.anchor_columns,
+        random_format_columns=random_format_map or None,
     )
     console.print(
         f"  -> {vresult.report.passed_count} passed, {vresult.report.failed_count} failed"

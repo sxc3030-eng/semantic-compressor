@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import string
 import time
 from datetime import datetime, timezone
 from graphlib import CycleError, TopologicalSorter
@@ -398,6 +399,71 @@ def _sample_distribution(
 
 
 # ---------------------------------------------------------------------------
+# 4b. Generation depuis un format spec (PatternType.RANDOM_FORMAT)
+# ---------------------------------------------------------------------------
+
+
+#: Pools de caracteres pour la generation des "body" d'un format aleatoire.
+#: Pour `uuid_v4` la generation est specialisee (cf. `generate_random_format_value`).
+_BODY_GENERATORS: dict[str, str | None] = {
+    "hex": "0123456789abcdef",
+    "uuid_v4": None,  # cas special, gere directement dans la generation
+    "ascii_lower": string.ascii_lowercase,
+    "digits": string.digits,
+    "alnum": string.ascii_letters + string.digits,
+}
+
+
+def generate_random_format_value(
+    rng: np.random.Generator, format_spec: dict[str, Any]
+) -> str:
+    """Genere une valeur conforme au format_spec en utilisant le rng fourni.
+
+    Pour `uuid_v4` : construit un UUID v4 valide via `rng.bytes(16)` + bits
+    version/variant (RFC 4122). Pour les autres body_types : tire `body_length`
+    caracteres dans le pool associe.
+
+    Args:
+        rng: generateur numpy seede (typiquement derive de l'anchor_id de la ligne).
+        format_spec: dict avec `prefix`, `suffix`, `body_type`, `body_length` (et
+            facultativement `regex` ignore ici, utilise seulement pour validation).
+
+    Returns:
+        La chaine `prefix + body + suffix`.
+    """
+    prefix = format_spec.get("prefix", "")
+    suffix = format_spec.get("suffix", "")
+    body_type = format_spec["body_type"]
+    body_length = int(format_spec["body_length"])
+
+    if body_type == "uuid_v4":
+        # Genere 16 bytes pseudo-aleatoires, force version=4 et variant=10xx
+        # comme defini par la RFC 4122. Le rng numpy permet la reproductibilite.
+        raw = rng.bytes(16)
+        b = bytearray(raw)
+        # Version 4 : bits 12-15 de l'octet 6 doivent etre 0100.
+        b[6] = (b[6] & 0x0F) | 0x40
+        # Variant : bits 6-7 de l'octet 8 doivent etre 10xx.
+        b[8] = (b[8] & 0x3F) | 0x80
+        hex_str = bytes(b).hex()
+        # Formatage UUID standard : 8-4-4-4-12.
+        body = f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
+        return f"{prefix}{body}{suffix}"
+
+    pool = _BODY_GENERATORS.get(body_type)
+    if pool is None or not pool:
+        raise ValueError(
+            f"Unsupported body_type {body_type!r} for RANDOM_FORMAT generation. "
+            f"Expected one of {sorted(k for k in _BODY_GENERATORS if k)}."
+        )
+    # rng.choice(list(pool), size=body_length) tire avec remise, ce qui est
+    # exactement ce qu'on veut pour un body genere caractere par caractere.
+    chars = rng.choice(list(pool), size=body_length)
+    body = "".join(chars.tolist())
+    return f"{prefix}{body}{suffix}"
+
+
+# ---------------------------------------------------------------------------
 # 5. Conversion de valeurs (datetime / typage final)
 # ---------------------------------------------------------------------------
 
@@ -576,12 +642,21 @@ def _apply_pattern(
     - DISTRIBUTION        : sample depuis distribution + params
     - FUNCTIONAL_DEP      : lookup_table.get(row[source_column])
     - CONDITIONAL_DISTRIBUTION : trouve le bucket de row[source_column] puis sample
+    - RANDOM_FORMAT       : genere depuis format_spec (prefix+body+suffix)
     """
     col = pattern.column
     pt = pattern.pattern_type
 
     if pt == PatternType.ANCHOR_DIRECT:
         return anchor_row.get(col)
+
+    if pt == PatternType.RANDOM_FORMAT:
+        if pattern.format_spec is None:  # pragma: no cover - garantie par le model_validator
+            raise ValueError(f"RANDOM_FORMAT pattern for {col} missing `format_spec`")
+        # On NE caste PAS via _cast_to_column_type ici : la valeur generee est
+        # deja une str au bon format. Caster en str() est sans effet, mais on
+        # evite tout transit defensif inutile.
+        return generate_random_format_value(rng, pattern.format_spec)
 
     if pt == PatternType.DISTRIBUTION:
         if pattern.distribution is None:  # pragma: no cover - garantie par le model_validator
@@ -710,9 +785,16 @@ def reconstruct(recipe: Recipe, anchors: pd.DataFrame) -> pd.DataFrame:
     # 2. Pre-cache : convertir les ancres en list-of-dicts une fois (O(N)) pour
     # eviter la penalite iloc[i] x N. On preserve l'ordre d'index.
     anchor_columns_in_df = list(anchors.columns)
-    if not anchor_columns_in_df:
-        raise ValueError("Anchors DataFrame is empty (no columns); cannot derive seeds")
-    seed_col = anchor_columns_in_df[0]
+    # Si on n'a aucune colonne d'ancre (cas extreme : toutes les colonnes uniques
+    # ont ete declarees RANDOM_FORMAT), on retombe sur l'index de ligne comme
+    # cle de seed. C'est moins ideal qu'un ID stable mais reste reproductible
+    # tant que l'index est preserve entre runs.
+    seed_col: str | None = anchor_columns_in_df[0] if anchor_columns_in_df else None
+    if seed_col is None:
+        logger.warning(
+            "Anchors DataFrame has no columns; falling back to row index as seed key. "
+            "Reproducibility relies on index stability."
+        )
     anchor_records = anchors.to_dict(orient="records")
     anchor_index = list(anchors.index)
 
@@ -723,7 +805,11 @@ def reconstruct(recipe: Recipe, anchors: pd.DataFrame) -> pd.DataFrame:
     log_every = max(1, n_rows // 10)  # logs progressifs sur les gros datasets
 
     for i, anchor_row in enumerate(anchor_records):
-        seed = derive_row_seed(anchor_row[seed_col])
+        if seed_col is not None:
+            seed_value = anchor_row[seed_col]
+        else:
+            seed_value = anchor_index[i]
+        seed = derive_row_seed(seed_value)
         rng = np.random.default_rng(seed)
 
         # Etat de la ligne en cours de construction (ordre topologique).

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -673,6 +674,145 @@ def test_categorical_frequencies(
 
 
 # ---------------------------------------------------------------------------
+# Random format compliance tests (cf. PatternType.RANDOM_FORMAT)
+# ---------------------------------------------------------------------------
+
+
+def test_random_format_compliance(
+    original: pd.Series,
+    reconstructed: pd.Series,
+    format_regex: str,
+) -> list[ValidationTestResult]:
+    """Tests softs pour les colonnes RANDOM_FORMAT.
+
+    Les colonnes RANDOM_FORMAT regenerent des valeurs uniques au lieu de
+    preserver les valeurs originales. On NE compare donc PAS les valeurs exactes.
+    On verifie a la place :
+
+    1. **format_match** : toutes les valeurs reconstruites matchent le regex.
+    2. **uniqueness**   : `n_unique(reconstructed)` >= 99% de `n_unique(original)`.
+    3. **length**       : moyenne de longueurs +/- 1 caractere (idem distribution
+       triviale puisque le format_spec impose une longueur exacte).
+
+    Retourne une liste de `ValidationTestResult` (3 entrees typiques).
+
+    Args:
+        original: serie d'origine (utile pour cardinality + longueur attendues).
+        reconstructed: serie reconstruite a verifier.
+        format_regex: regex du format spec ; toutes les valeurs doivent matcher.
+    """
+    col = original.name or "<unnamed>"
+    results: list[ValidationTestResult] = []
+
+    a = original.dropna().astype(str)
+    b = reconstructed.dropna().astype(str)
+
+    if a.empty or b.empty:
+        results.append(
+            ValidationTestResult(
+                test_name=f"random_format_compliance[{col}]",
+                metric="non_empty",
+                expected="non-empty original and reconstructed",
+                actual=f"orig={len(a)}, recon={len(b)}",
+                threshold=None,
+                passed=False,
+                details="Cannot validate random format on empty series",
+            )
+        )
+        return results
+
+    # ---- 1. format_match ----
+    try:
+        compiled = re.compile(format_regex)
+    except re.error as exc:
+        results.append(
+            ValidationTestResult(
+                test_name=f"random_format[{col}]/format_match",
+                metric="all_match_regex",
+                expected="valid regex",
+                actual=f"invalid: {exc}",
+                threshold=None,
+                passed=False,
+                details=f"format_regex did not compile: {exc}",
+            )
+        )
+        return results
+
+    # On verifie TOUTES les valeurs reconstruites (cheap : str regex sur ~10k).
+    n_match = int(b.map(lambda v: bool(compiled.match(v))).sum())
+    match_passed = n_match == len(b)
+    results.append(
+        ValidationTestResult(
+            test_name=f"random_format[{col}]/format_match",
+            metric="all_match_regex",
+            expected=f"100% match ({len(b)}/{len(b)})",
+            actual=f"{n_match}/{len(b)}",
+            threshold=None,
+            passed=match_passed,
+            details=(
+                f"All {len(b)} reconstructed values match regex {format_regex!r}"
+                if match_passed
+                else f"Only {n_match}/{len(b)} values match regex {format_regex!r}"
+            ),
+        )
+    )
+
+    # ---- 2. uniqueness ----
+    n_unique_orig = int(a.nunique())
+    n_unique_recon = int(b.nunique())
+    # Tolerance : on accepte 99% du compte original (collisions stochastiques
+    # possibles sur de tres petits body_length, mais sur ~64 hex chars la
+    # probabilite de collision sur 10k tirages est negligeable -- approx 2^-200).
+    uniqueness_threshold = 0.99
+    if n_unique_orig == 0:
+        uniqueness_passed = n_unique_recon == 0
+        uniqueness_ratio = 1.0 if uniqueness_passed else 0.0
+    else:
+        uniqueness_ratio = n_unique_recon / n_unique_orig
+        uniqueness_passed = uniqueness_ratio >= uniqueness_threshold
+    results.append(
+        ValidationTestResult(
+            test_name=f"random_format[{col}]/uniqueness",
+            metric="unique_ratio",
+            expected=f">= {uniqueness_threshold}",
+            actual=float(uniqueness_ratio),
+            threshold=uniqueness_threshold,
+            passed=uniqueness_passed,
+            details=(
+                f"original n_unique={n_unique_orig}, reconstructed n_unique={n_unique_recon} "
+                f"(ratio={uniqueness_ratio:.4f})"
+            ),
+        )
+    )
+
+    # ---- 3. length distribution ----
+    mean_len_orig = float(a.map(len).mean())
+    mean_len_recon = float(b.map(len).mean())
+    length_diff = abs(mean_len_orig - mean_len_recon)
+    length_passed = length_diff <= 1.0
+    results.append(
+        ValidationTestResult(
+            test_name=f"random_format[{col}]/length",
+            metric="mean_length_diff",
+            expected="<= 1",
+            actual=float(length_diff),
+            threshold=1.0,
+            passed=length_passed,
+            details=(
+                f"mean_length orig={mean_len_orig:.2f}, recon={mean_len_recon:.2f}, "
+                f"diff={length_diff:.2f}"
+            ),
+        )
+    )
+
+    logger.debug(
+        "random_format_compliance[%s]: match=%s unique=%s length=%s",
+        col, match_passed, uniqueness_passed, length_passed,
+    )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
@@ -734,6 +874,7 @@ def validate(
     reconstructed: pd.DataFrame,
     anchor_columns: list[str] | None = None,
     thresholds: ValidationThresholds | None = None,
+    random_format_columns: dict[str, str] | None = None,
 ) -> ValidationReport:
     """Pipeline complet de validation original vs reconstruit.
 
@@ -745,19 +886,34 @@ def validate(
        - numerique : KS + mean
        - datetime : KS
        - categoriel : frequences
+       - random_format : compliance (regex + uniqueness + length)
     3. Selectionne les paires les plus correlees et teste la preservation.
     4. Construit le ValidationReport.
 
     Schema de ponderation du score : tests structurels x2, statistiques x1
     (voir `_compute_score`).
+
+    Args:
+        original: DataFrame d'origine.
+        reconstructed: DataFrame reconstruit.
+        anchor_columns: colonnes a comparer en strict (egalite). Si non fournies,
+            on n'execute pas les tests d'ancres.
+        thresholds: seuils de tolerance ; defaut = ValidationThresholds().
+        random_format_columns: mapping `{col_name: format_regex}` pour les colonnes
+            qui ont ete generees via RANDOM_FORMAT. Pour ces colonnes on saute
+            les tests d'egalite + cat_freq, on lance a la place le test de
+            compliance (regex + uniqueness + length).
     """
     thresholds = thresholds or ValidationThresholds()
     anchor_columns = anchor_columns or []
+    random_format_columns = random_format_columns or {}
+    random_format_set = set(random_format_columns.keys())
 
     logger.info(
-        "Starting validation: original=%s rows x %s cols, reconstructed=%s rows x %s cols, anchors=%s",
+        "Starting validation: original=%s rows x %s cols, reconstructed=%s rows x %s cols, "
+        "anchors=%s, random_format_columns=%s",
         len(original), len(original.columns), len(reconstructed), len(reconstructed.columns),
-        anchor_columns,
+        anchor_columns, sorted(random_format_set),
     )
 
     structural: list[ValidationTestResult] = []
@@ -772,8 +928,13 @@ def validate(
     structural.append(schema_result)
 
     if anchor_columns:
-        anchor_results = test_anchors_exact(original, reconstructed, anchor_columns)
-        structural.extend(anchor_results)
+        # On ne teste les ancres en strict QUE pour les colonnes qui ne sont pas
+        # RANDOM_FORMAT (ces dernieres regenerent des valeurs differentes par
+        # design ; voir test_random_format_compliance pour le test softs).
+        anchor_cols_to_check = [c for c in anchor_columns if c not in random_format_set]
+        if anchor_cols_to_check:
+            anchor_results = test_anchors_exact(original, reconstructed, anchor_cols_to_check)
+            structural.extend(anchor_results)
 
     # Court-circuit : si les comptes different, les tests statistiques colonne-par-colonne
     # auraient un comportement non defini (ex: ks_2samp sur tailles tres differentes
@@ -797,7 +958,12 @@ def validate(
     # ----- Tests statistiques par colonne -----
     logger.info("Running per-column statistical tests")
     common_cols = [c for c in original.columns if c in reconstructed.columns]
-    non_anchor_cols = [c for c in common_cols if c not in set(anchor_columns)]
+    # Pour les tests stats non-ancres : on exclut a la fois les anchor_columns
+    # (deja testees en strict) et les random_format_columns (testees a part).
+    non_anchor_cols = [
+        c for c in common_cols
+        if c not in set(anchor_columns) and c not in random_format_set
+    ]
 
     for col in non_anchor_cols:
         s_orig, s_recon = original[col], reconstructed[col]
@@ -815,6 +981,18 @@ def validate(
             )
         else:
             logger.debug("Column %s skipped: unsupported dtype %s", col, s_orig.dtype)
+
+    # ----- Random format compliance -----
+    if random_format_columns:
+        logger.info("Running random format compliance tests on %d cols", len(random_format_columns))
+        for col, format_regex in random_format_columns.items():
+            if col not in original.columns or col not in reconstructed.columns:
+                logger.debug("random_format column %r missing from one DataFrame, skipping", col)
+                continue
+            rf_results = test_random_format_compliance(
+                original[col], reconstructed[col], format_regex
+            )
+            statistical.extend(rf_results)
 
     # ----- Correlations -----
     logger.info("Running correlation preservation tests")
@@ -945,6 +1123,7 @@ __all__ = [
     "test_mean_within_tolerance",
     "test_correlation_preserved",
     "test_categorical_frequencies",
+    "test_random_format_compliance",
     "print_report",
 ]
 
@@ -962,6 +1141,7 @@ for _fn in (
     test_mean_within_tolerance,
     test_correlation_preserved,
     test_categorical_frequencies,
+    test_random_format_compliance,
 ):
     _fn.__test__ = False  # type: ignore[attr-defined]
 del _fn

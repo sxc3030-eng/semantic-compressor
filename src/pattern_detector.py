@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any
+import re
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -676,6 +677,127 @@ def detect_conditional_distributions(
 
 
 # ---------------------------------------------------------------------------
+# 4b. Detection des "random formats" (valeurs uniques mais valeur exacte non
+# informative, ex: bcrypt hashes). Pour ces colonnes on ne stocke PAS d'ancre :
+# on garde uniquement le format dans la recette et on regenere des valeurs
+# conformes au format a la reconstruction. Cf. PatternType.RANDOM_FORMAT.
+# ---------------------------------------------------------------------------
+
+
+def _parse_bcrypt(sample_value: str) -> dict[str, Any]:
+    """Parse une chaine bcrypt-like et extrait son format spec.
+
+    Format reconnu : `$bcrypt$<version>$<cost>$<hex_body>$`
+    Exemple : `$bcrypt$2b$12$abc...def$` -> prefix=`$bcrypt$2b$12$`, suffix=`$`,
+    body_type=hex, body_length=len(hex_body).
+    """
+    match = re.match(r"^(\$bcrypt\$\d+[a-z]?\$\d+\$)([0-9a-f]+)(\$)$", sample_value)
+    if match is None:
+        raise ValueError(f"Not a bcrypt-formatted value: {sample_value!r}")
+    prefix, body, suffix = match.group(1), match.group(2), match.group(3)
+    body_length = len(body)
+    # Le prefix contient des caracteres regex speciaux ($, on les escape).
+    escaped_prefix = re.escape(prefix)
+    escaped_suffix = re.escape(suffix)
+    regex = rf"^{escaped_prefix}[0-9a-f]{{{body_length}}}{escaped_suffix}$"
+    return {
+        "prefix": prefix,
+        "suffix": suffix,
+        "body_type": "hex",
+        "body_length": body_length,
+        "regex": regex,
+    }
+
+
+def _parse_hex_hash(sample_value: str) -> dict[str, Any]:
+    """Parse une chaine hex (sans prefix/suffix) et extrait son format spec.
+
+    Exemple : `a3b9c2...` (32 a 128 chars hex purs) -> body_type=hex, body_length=len.
+    """
+    if not re.match(r"^[0-9a-f]+$", sample_value):
+        raise ValueError(f"Not a hex-only value: {sample_value!r}")
+    body_length = len(sample_value)
+    regex = rf"^[0-9a-f]{{{body_length}}}$"
+    return {
+        "prefix": "",
+        "suffix": "",
+        "body_type": "hex",
+        "body_length": body_length,
+        "regex": regex,
+    }
+
+
+#: Catalogue des formats aleatoires reconnus automatiquement par
+#: `detect_random_format`. Une entree par format ; chaque entree contient :
+#: - `regex` : pattern de matching utilise pour valider qu'une serie complete
+#:   colle a ce format (verifie au moins 95% des valeurs)
+#: - `extract_format` : fonction (sample_value) -> format_spec dict
+#:
+#: UUID v4 et email ne sont volontairement PAS dans ce catalogue : `id` doit
+#: rester ancre direct (preserve la valeur exacte) et `email` aussi (c'est une
+#: identite user-facing). L'utilisateur peut forcer manuellement via le
+#: parametre `manual_random_format_columns` de `build_patterns` si besoin.
+KNOWN_RANDOM_FORMATS: dict[str, dict[str, Any]] = {
+    "bcrypt_hash": {
+        "regex": re.compile(r"^\$bcrypt\$\d+[a-z]?\$\d+\$[0-9a-f]+\$$"),
+        "extract_format": _parse_bcrypt,
+    },
+    "hex_hash": {
+        # On exige une longueur >= 32 pour eviter de matcher des UUIDs courts
+        # ou des prefixes hex. Pas de borne sup pour les SHA-512 etc.
+        "regex": re.compile(r"^[0-9a-f]{32,128}$"),
+        "extract_format": _parse_hex_hash,
+    },
+}
+
+
+def detect_random_format(
+    series: pd.Series,
+    *,
+    sample_size: int = 100,
+    min_match_ratio: float = 0.95,
+) -> dict[str, Any] | None:
+    """Detecte si une colonne string matche un format aleatoire connu.
+
+    Echantillonne jusqu'a `sample_size` valeurs non-nulles, teste chaque format
+    de `KNOWN_RANDOM_FORMATS`, et retourne le `format_spec` du format qui matche
+    au moins `min_match_ratio` (95% par defaut). Retourne None si aucun format
+    ne convient.
+    """
+    cleaned = series.dropna()
+    if cleaned.empty:
+        return None
+    # On garantit un sample stable : si la serie est plus petite que `sample_size`,
+    # on prend tout. Sinon on prend les `sample_size` premieres pour reproductibilite.
+    sample = cleaned.head(sample_size).astype(str).tolist()
+    if not sample:
+        return None
+
+    for format_name, spec in KNOWN_RANDOM_FORMATS.items():
+        regex: re.Pattern[str] = spec["regex"]
+        matches = sum(1 for v in sample if regex.match(v))
+        if matches / len(sample) >= min_match_ratio:
+            # Format detecte : extrait le format_spec depuis la 1ere valeur qui matche.
+            for v in sample:
+                if regex.match(v):
+                    try:
+                        format_spec = spec["extract_format"](v)
+                        format_spec["detected_as"] = format_name
+                        logger.info(
+                            "detect_random_format: column %r matches %r (%d/%d sample matches)",
+                            series.name, format_name, matches, len(sample),
+                        )
+                        return format_spec
+                    except ValueError as exc:
+                        logger.debug(
+                            "  format %r regex matched but extract_format failed: %s",
+                            format_name, exc,
+                        )
+                        break  # passe au format suivant
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 5. Build patterns (pipeline complet)
 # ---------------------------------------------------------------------------
 
@@ -735,23 +857,80 @@ def build_patterns(
     df: pd.DataFrame,
     profiles: list[ColumnProfile],
     anchor_columns: list[str],
+    manual_random_format_columns: list[str] | None = None,
 ) -> list[Pattern]:
     """Pipeline de detection complet : combine FD + distributions + correlations en list[Pattern].
 
     Resolution des conflits (par ordre de priorite pour chaque colonne) :
+    0. Colonne dans `manual_random_format_columns` OU dans `anchor_columns` ET
+       detectee automatiquement comme format aleatoire connu -> RANDOM_FORMAT
+       (la valeur n'est PAS stockee comme ancre, on regenere au runtime).
     1. Colonne dans `anchor_columns` -> ANCHOR_DIRECT
     2. Dependance fonctionnelle A -> B (B == colonne courante, A != colonne courante) -> FUNCTIONAL_DEP
     3. Correlation forte avec une autre colonne non-ancre -> CONDITIONAL_DISTRIBUTION
     4. Fallback -> DISTRIBUTION univariee (ou CATEGORICAL_FREQ pour les colonnes categorielles)
+
+    Args:
+        df: DataFrame source.
+        profiles: profils par colonne (un par colonne attendue).
+        anchor_columns: liste des colonnes ancres candidates (cardinalite 1.0 ou forcees).
+        manual_random_format_columns: liste de colonnes a forcer en RANDOM_FORMAT
+            (la detection automatique ne marque PAS ces colonnes par defaut sauf
+            si elles matchent un format de `KNOWN_RANDOM_FORMATS`).
     """
     logger.info(
-        "build_patterns: %d cols (%d ancres), %d rows",
+        "build_patterns: %d cols (%d ancres), %d rows, manual_random_format=%s",
         df.shape[1],
         len(anchor_columns),
         df.shape[0],
+        manual_random_format_columns or [],
     )
     anchor_set = set(anchor_columns)
+    manual_random_set = set(manual_random_format_columns or [])
     profile_index = {p.name: p for p in profiles}
+
+    # Pre-detection des colonnes "random format" : on auto-detecte sur les
+    # colonnes a haute cardinalite (>= 95% unique), qui sont typiquement des
+    # candidates ancres mais pourraient avoir ete exclues du `anchor_columns`
+    # entrant (ex: pass 3 de l'orchestrator qui passe `anchor_columns` sans les
+    # RANDOM_FORMAT pour eviter le conflit).
+    # Les colonnes dans `manual_random_format_columns` sont prises avec detection
+    # automatique : si le format n'est pas reconnu on log un warning et on
+    # retombe sur le comportement par defaut.
+    random_format_specs: dict[str, dict[str, Any]] = {}
+    for col in df.columns:
+        profile = profile_index.get(col)
+        # Eligibilite a l'auto-detection : la colonne doit etre unique ou
+        # quasi-unique (sinon ce n'est pas un "random format"). Le critere est
+        # n_unique / n_total >= 0.95 ; le profil expose `cardinality` pour ca.
+        is_high_cardinality = (
+            profile is not None
+            and profile.n_total > 0
+            and (profile.n_unique / profile.n_total) >= 0.95
+        )
+
+        # Detection auto sur les colonnes a haute cardinalite (peut etre ancre
+        # ou non, peu importe : si ca matche un format connu on le marque).
+        if is_high_cardinality or col in anchor_set:
+            spec = detect_random_format(df[col])
+            if spec is not None:
+                random_format_specs[col] = spec
+                logger.info("  column %r auto-detected as RANDOM_FORMAT (%s)", col, spec.get("detected_as"))
+                continue
+        # Forcage manuel : on tente quand meme de detecter le format pour extraire
+        # le spec. Si la detection echoue (format inconnu), on log un warning et
+        # on retombe sur le comportement par defaut pour cette colonne.
+        if col in manual_random_set:
+            spec = detect_random_format(df[col])
+            if spec is not None:
+                random_format_specs[col] = spec
+                logger.info("  column %r forced as RANDOM_FORMAT (%s)", col, spec.get("detected_as"))
+            else:
+                logger.warning(
+                    "  column %r is in manual_random_format_columns but no known format matches; "
+                    "falling back to default behavior",
+                    col,
+                )
 
     # 1. Pre-compute dependances fonctionnelles, distributions, correlations.
     fdeps = detect_functional_dependencies(df)
@@ -771,6 +950,21 @@ def build_patterns(
 
     for col in df.columns:
         profile = profile_index.get(col)
+
+        # 0. Random format : la colonne a une valeur unique mais sa valeur exacte
+        # n'est pas informative (ex: bcrypt hash). On stocke uniquement le format
+        # dans la recette ; pas d'ancre, pas de cardinalite preservee.
+        if col in random_format_specs:
+            patterns.append(
+                Pattern(
+                    column=col,
+                    pattern_type=PatternType.RANDOM_FORMAT,
+                    format_spec=random_format_specs[col],
+                    fidelity_estimate=1.0,
+                    dependencies=[],
+                )
+            )
+            continue
 
         # 1. Ancre
         if col in anchor_set:
@@ -906,5 +1100,7 @@ __all__ = [
     "cramers_v",
     "detect_correlations",
     "detect_conditional_distributions",
+    "detect_random_format",
+    "KNOWN_RANDOM_FORMATS",
     "build_patterns",
 ]

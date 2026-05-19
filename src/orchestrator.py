@@ -40,6 +40,7 @@ from .models import (
     ColumnProfile,
     ColumnType,
     Pattern,
+    PatternType,
     Recipe,
     RecipeMetadata,
     ValidationReport,
@@ -167,6 +168,21 @@ def _detect_unique_anchor_columns(df: pd.DataFrame) -> list[str]:
     return out
 
 
+def _extract_random_format_columns_from_recipe(recipe: Recipe) -> dict[str, str]:
+    """Extrait le mapping `{col: format_regex}` pour les colonnes RANDOM_FORMAT d'une recette.
+
+    Utile pour appeler `validate` avec le bon parametre `random_format_columns`
+    apres une decompression.
+    """
+    out: dict[str, str] = {}
+    for pat in recipe.patterns:
+        if pat.pattern_type == PatternType.RANDOM_FORMAT and pat.format_spec is not None:
+            regex = pat.format_spec.get("regex")
+            if regex:
+                out[pat.column] = regex
+    return out
+
+
 def _build_validation_tests(
     profiles: list[ColumnProfile], n_rows: int
 ) -> list[dict[str, Any]]:
@@ -203,6 +219,7 @@ def compress(
     output_dir: Path,
     table_name: str | None = None,
     manual_anchor_columns: list[str] | None = None,
+    manual_random_format_columns: list[str] | None = None,
     parquet_codec: str = "zstd",
     parquet_compression_level: int | None = 22,
     generate_html_profile: bool = False,
@@ -214,6 +231,10 @@ def compress(
         output_dir: repertoire de sortie ; on y cree `recipes/` et `anchors/`.
         table_name: nom logique de la table (defaut : nom du fichier sans extension).
         manual_anchor_columns: colonnes a forcer en ancre (en plus de la detection).
+        manual_random_format_columns: colonnes a forcer comme RANDOM_FORMAT (valeur
+            non preservee, regeneree depuis un format_spec). Utile pour les
+            colonnes du genre `password_hash` ou la valeur exacte ne porte pas
+            d'information mais le format si.
         parquet_codec: codec de compression parquet (zstd / snappy / gzip / brotli).
         parquet_compression_level: niveau de compression (22 = max zstd ; ignore par snappy).
         generate_html_profile: si True, genere aussi le rapport ydata-profiling.
@@ -258,21 +279,34 @@ def compress(
 
     # 3. Resolution de la dependance cyclique anchors <-> patterns en triple passe.
     # Pass 1 : ancres heuristiques (cardinalite stricte + manuelles).
+    # On passe random_format_columns pour exclure ces colonnes des ancres des le pass 1.
     _prelim_anchors_df, prelim_anchor_cols = extract_anchors(
-        df, profiles, patterns=None, manual_anchor_columns=manual_anchor_columns,
+        df, profiles,
+        patterns=None,
+        manual_anchor_columns=manual_anchor_columns,
+        random_format_columns=manual_random_format_columns,
     )
     logger.info("  pass 1 (prelim anchors): %s", prelim_anchor_cols)
 
-    # Pass 2 : on construit les patterns avec ces ancres comme reference.
+    # Pass 2 : on construit les patterns avec ces ancres comme reference. Le
+    # forcage manuel de RANDOM_FORMAT est passe a build_patterns ; les colonnes
+    # ancres candidates restantes peuvent aussi etre auto-detectees comme
+    # RANDOM_FORMAT (ex: si on n'a pas force et qu'une colonne unique matche
+    # KNOWN_RANDOM_FORMATS, build_patterns la marque RANDOM_FORMAT).
     patterns: list[Pattern] = build_patterns(
-        df, profiles, anchor_columns=prelim_anchor_cols
+        df, profiles,
+        anchor_columns=prelim_anchor_cols,
+        manual_random_format_columns=manual_random_format_columns,
     )
     logger.info("  pass 2 (patterns): %d patterns built", len(patterns))
 
-    # Pass 3 : ancres finales (les colonnes "no pattern" peuvent maintenant etre
-    # marquees comme ancres meme si elles ne sont pas strictement uniques).
+    # Pass 3 : ancres finales. Les patterns RANDOM_FORMAT excluent les colonnes
+    # concernees des ancres (via extract_anchors qui regarde patterns).
     final_anchors_df, final_anchor_cols = extract_anchors(
-        df, profiles, patterns=patterns, manual_anchor_columns=manual_anchor_columns,
+        df, profiles,
+        patterns=patterns,
+        manual_anchor_columns=manual_anchor_columns,
+        random_format_columns=manual_random_format_columns,
     )
     logger.info("  pass 3 (final anchors): %s", final_anchor_cols)
 
@@ -284,7 +318,11 @@ def compress(
             "  anchor set changed between pass 1 and pass 3 (%s -> %s); rebuilding patterns",
             prelim_anchor_cols, final_anchor_cols,
         )
-        patterns = build_patterns(df, profiles, anchor_columns=final_anchor_cols)
+        patterns = build_patterns(
+            df, profiles,
+            anchor_columns=final_anchor_cols,
+            manual_random_format_columns=manual_random_format_columns,
+        )
 
     anchor_path = output_dir / "anchors" / f"{table_name}_anchors.parquet"
     recipe_path = output_dir / "recipes" / f"{table_name}.md"
@@ -448,6 +486,7 @@ def validate_pair(
     original_csv: Path,
     reconstructed_csv: Path,
     anchor_columns: list[str] | None = None,
+    random_format_columns: dict[str, str] | None = None,
 ) -> ValidationResultBundle:
     """Lit deux CSVs et compare leur fidelite statistique.
 
@@ -457,6 +496,9 @@ def validate_pair(
         anchor_columns: colonnes a valider en strict (egalite exacte). Si None,
             on detecte automatiquement les colonnes a cardinalite 1.0 dans
             l'original.
+        random_format_columns: mapping `{col: format_regex}` pour les colonnes
+            RANDOM_FORMAT (test softs au lieu de comparaison stricte). Voir
+            `validator.test_random_format_compliance`.
 
     Returns:
         ValidationResultBundle (report + temps ecoule).
@@ -483,7 +525,11 @@ def validate_pair(
         anchor_columns = _detect_unique_anchor_columns(original)
         logger.info("  auto-detected anchor columns: %s", anchor_columns)
 
-    report = validate(original, reconstructed, anchor_columns=anchor_columns)
+    report = validate(
+        original, reconstructed,
+        anchor_columns=anchor_columns,
+        random_format_columns=random_format_columns,
+    )
     elapsed = time.perf_counter() - t0
     logger.info(
         "validate_pair done in %.3fs: score=%.2f passed=%d failed=%d",
@@ -631,6 +677,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated list of columns to force as anchors.",
     )
     p_compress.add_argument(
+        "--random-format",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of columns to mark as RANDOM_FORMAT: "
+            "their exact value is not preserved across reconstruction, only "
+            "the format spec (regex/length) is stored in the recipe and unique "
+            "values are regenerated at runtime. Typical use: password_hash. "
+            "These columns are excluded from anchors."
+        ),
+    )
+    p_compress.add_argument(
         "--codec",
         type=str,
         default="zstd",
@@ -718,6 +776,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated list of columns to force as anchors.",
     )
+    p_run.add_argument(
+        "--random-format",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of columns to mark as RANDOM_FORMAT "
+            "(value not preserved, regenerated from format spec at runtime). "
+            "Typical use: password_hash."
+        ),
+    )
 
     return parser
 
@@ -734,11 +802,13 @@ def _cmd_compress(args: argparse.Namespace) -> int:
     from rich.console import Console
 
     manual = _parse_csv_list(args.manual_anchors)
+    random_format = _parse_csv_list(args.random_format)
     result = compress(
         input_csv=args.input,
         output_dir=args.output,
         table_name=args.table_name,
         manual_anchor_columns=manual,
+        manual_random_format_columns=random_format,
         parquet_codec=args.codec,
         parquet_compression_level=args.level,
         generate_html_profile=args.generate_html_profile,
@@ -814,10 +884,12 @@ def _cmd_run_poc(args: argparse.Namespace) -> int:
     # 1. Compress
     console.print("\n[bold]Step 1 / 3 :[/] compress")
     manual = _parse_csv_list(args.manual_anchors)
+    random_format = _parse_csv_list(args.random_format)
     compress_result = compress(
         input_csv=args.input,
         output_dir=args.output_dir,
         manual_anchor_columns=manual,
+        manual_random_format_columns=random_format,
         parquet_codec=args.codec,
         parquet_compression_level=args.level,
     )
@@ -840,10 +912,15 @@ def _cmd_run_poc(args: argparse.Namespace) -> int:
 
     # 3. Validate
     console.print("\n[bold]Step 3 / 3 :[/] validate")
+    # Pour les colonnes RANDOM_FORMAT, on relit la recette pour extraire
+    # leur format_regex et passer ce mapping au validator.
+    recipe = parse_recipe(compress_result.recipe_path)
+    random_format_map = _extract_random_format_columns_from_recipe(recipe)
     validate_result = validate_pair(
         original_csv=args.input,
         reconstructed_csv=reconstructed_csv,
         anchor_columns=compress_result.anchor_columns,
+        random_format_columns=random_format_map or None,
     )
     console.print(
         f"  -> {validate_result.report.passed_count} passed, "

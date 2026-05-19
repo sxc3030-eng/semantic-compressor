@@ -73,6 +73,11 @@ class PatternType(str, Enum):
     FUNCTIONAL_DEP = "functional_dep"
     CONDITIONAL_DISTRIBUTION = "conditional_distribution"
     ANCHOR_DIRECT = "anchor_direct"
+    # Colonnes dont la valeur exacte ne porte pas d'information : on ne stocke
+    # que le format (regex/prefix/suffix/body_type/body_length) dans la recette
+    # et on regenere des valeurs uniques conformes au format a la reconstruction.
+    # Exemple typique : password_hash bcrypt-like. Pas d'ancre stockee.
+    RANDOM_FORMAT = "random_format"
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +256,10 @@ class Pattern(_StrictModel):
     conditional_buckets: list[dict[str, Any]] | None = None
     fidelity_estimate: float = Field(default=1.0, ge=0.0, le=1.0)
     dependencies: list[str] = Field(default_factory=list)
+    # Specification d'un format aleatoire (RANDOM_FORMAT). Structure attendue :
+    # {"prefix": str, "suffix": str, "body_type": str, "body_length": int, "regex": str}
+    # body_type est l'un de : "hex", "uuid_v4", "ascii_lower", "digits", "alnum".
+    format_spec: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _check_shape(self) -> Pattern:
@@ -267,6 +276,15 @@ class Pattern(_StrictModel):
                 raise ValueError("CONDITIONAL_DISTRIBUTION pattern requires `source_column`")
             if not self.conditional_buckets:
                 raise ValueError("CONDITIONAL_DISTRIBUTION pattern requires `conditional_buckets`")
+        if pt == PatternType.RANDOM_FORMAT:
+            if self.format_spec is None:
+                raise ValueError("RANDOM_FORMAT pattern requires `format_spec`")
+            required_keys = {"prefix", "suffix", "body_type", "body_length", "regex"}
+            missing = required_keys - set(self.format_spec.keys())
+            if missing:
+                raise ValueError(
+                    f"RANDOM_FORMAT `format_spec` is missing required keys: {sorted(missing)}"
+                )
         return self
 
 

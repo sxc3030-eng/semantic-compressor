@@ -34,6 +34,7 @@ def extract_anchors(
     profiles: list[ColumnProfile],
     patterns: list[Pattern] | None = None,
     manual_anchor_columns: list[str] | None = None,
+    random_format_columns: list[str] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Identifie les colonnes ancres et retourne (df_anchors, anchor_column_names).
 
@@ -42,6 +43,12 @@ def extract_anchors(
            sans nulls — calcule en amont par le profiler).
         2. Elle est dans `manual_anchor_columns`.
         3. `patterns` est fourni mais aucun pattern ne mappe cette colonne.
+
+    EXCEPTIONS (colonne PAS marquee ancre meme si la regle 1 s'applique) :
+        - Colonne dont le pattern est `RANDOM_FORMAT` (regenerable depuis spec) :
+          si `patterns` est fourni, exclure les colonnes RANDOM_FORMAT.
+        - Colonne dans `random_format_columns` : exclusion directe (utilise quand
+          `patterns` n'est pas encore disponible, typ. pass 1 de l'orchestrator).
 
     L'ordre des colonnes en sortie suit l'ordre d'origine dans `df`. L'index est
     preserve (sera utilise comme cle de seeding par le reconstructor).
@@ -52,6 +59,10 @@ def extract_anchors(
         patterns: regles de generation deja detectees ; si None, on n'utilise
             pas la regle "absence de pattern".
         manual_anchor_columns: noms forces comme ancres ; doivent exister dans `df`.
+        random_format_columns: noms forces comme RANDOM_FORMAT a exclure des ancres,
+            utile quand `patterns` n'est pas encore construit. Si `patterns` est
+            fourni, ce parametre est redondant (les RANDOM_FORMAT sont identifies
+            via patterns) mais reste accepte par coherence.
 
     Returns:
         (df_anchors, anchor_column_names) ou df_anchors est restreint aux ancres.
@@ -78,16 +89,30 @@ def extract_anchors(
 
     # Colonnes ayant un pattern de generation (autre qu'ANCHOR_DIRECT) =
     # regenerables. ANCHOR_DIRECT ne compte pas comme regenerable.
+    # RANDOM_FORMAT est aussi regenerable -> a exclure des ancres.
     columns_with_pattern: set[str] = set()
+    random_format_from_patterns: set[str] = set()
     if patterns is not None:
         for pat in patterns:
             if pat.pattern_type.value != "anchor_direct":
                 columns_with_pattern.add(pat.column)
+            if pat.pattern_type.value == "random_format":
+                random_format_from_patterns.add(pat.column)
+
+    # Union des colonnes a exclure (via patterns ou via param explicite).
+    excluded_random_format = set(random_format_columns or []) | random_format_from_patterns
 
     manual_set = set(manual)
     anchor_columns: list[str] = []
 
     for col in df.columns:  # preservation de l'ordre d'origine
+        # Exclusion prioritaire : les colonnes random_format ne deviennent JAMAIS
+        # des ancres (meme si manuellement forcees comme ancres -- ce serait une
+        # contradiction). On laisse l'utilisateur arbitrer en amont.
+        if col in excluded_random_format:
+            logger.debug("Column %r excluded from anchors (reason=random_format)", col)
+            continue
+
         is_anchor = False
         reason = ""
 

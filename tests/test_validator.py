@@ -342,3 +342,73 @@ def test_identical_users_csv_validation() -> None:
     )
     assert report.failed_count == 0
     assert report.is_fidelity_target_met is True
+
+
+# ---------------------------------------------------------------------------
+# RANDOM_FORMAT compliance tests
+# ---------------------------------------------------------------------------
+
+
+def test_random_format_compliance_pass() -> None:
+    """Toutes valeurs reconstruites matchent le regex et toutes uniques -> pass."""
+    from src.validator import test_random_format_compliance
+
+    # Original : 100 bcrypt-like strings
+    rng_o = np.random.default_rng(0)
+    originals = [
+        f"$bcrypt$2b$12${''.join(rng_o.choice(list('0123456789abcdef'), size=64).tolist())}$"
+        for _ in range(100)
+    ]
+    # Reconstructed : DIFFERENT bcrypt-like strings (mais meme format)
+    rng_r = np.random.default_rng(999)
+    reconstructed = [
+        f"$bcrypt$2b$12${''.join(rng_r.choice(list('0123456789abcdef'), size=64).tolist())}$"
+        for _ in range(100)
+    ]
+    assert originals != reconstructed, "Sanity: originals must differ from reconstructed"
+
+    a = pd.Series(originals, name="password_hash")
+    b = pd.Series(reconstructed, name="password_hash")
+    regex = r"^\$bcrypt\$2b\$12\$[0-9a-f]{64}\$$"
+
+    results = test_random_format_compliance(a, b, regex)
+    # 3 tests : format_match, uniqueness, length
+    assert len(results) == 3
+    for r in results:
+        assert r.passed, (
+            f"Expected all RANDOM_FORMAT compliance tests to pass, but {r.test_name} failed: "
+            f"{r.details}"
+        )
+
+
+def test_random_format_compliance_fail_on_format() -> None:
+    """Une valeur reconstruite qui ne matche pas la regex -> format_match fail."""
+    from src.validator import test_random_format_compliance
+
+    rng = np.random.default_rng(0)
+    originals = [
+        f"$bcrypt$2b$12${''.join(rng.choice(list('0123456789abcdef'), size=64).tolist())}$"
+        for _ in range(100)
+    ]
+    # Reconstructed : on remplace volontairement la valeur n=10 par une chaine
+    # qui ne matche pas la regex.
+    reconstructed = list(originals)
+    rng2 = np.random.default_rng(1)
+    reconstructed = [
+        f"$bcrypt$2b$12${''.join(rng2.choice(list('0123456789abcdef'), size=64).tolist())}$"
+        for _ in range(100)
+    ]
+    reconstructed[10] = "NOT_A_BCRYPT_HASH"
+
+    a = pd.Series(originals, name="password_hash")
+    b = pd.Series(reconstructed, name="password_hash")
+    regex = r"^\$bcrypt\$2b\$12\$[0-9a-f]{64}\$$"
+
+    results = test_random_format_compliance(a, b, regex)
+    by_name = {r.test_name: r for r in results}
+    # Le test de format_match doit echouer (99/100 match, pas 100).
+    assert "random_format[password_hash]/format_match" in by_name
+    assert by_name["random_format[password_hash]/format_match"].passed is False, (
+        f"Expected format_match to fail on bad value, "
+        f"got {by_name['random_format[password_hash]/format_match'].details}"
+    )
