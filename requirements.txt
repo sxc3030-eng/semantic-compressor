@@ -10,7 +10,7 @@ duckdb>=1.0
 pydantic>=2.6
 
 # Statistical tests (KS, Shapiro-Wilk, Pearson, ANOVA, distribution fitting)
-scipy>=1.11
+scipy>=1.17.1
 
 # Profiling (initial exploration + structured profile extraction)
 ydata-profiling>=4.10
