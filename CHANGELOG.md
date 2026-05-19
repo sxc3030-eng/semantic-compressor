@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Stress test benchmarks at 1k / 10k / 100k rows
+- `docs/BENCHMARKS.md` with timing tables and scaling plot
+- `output/benchmarks/scaling.png` (log-log time + linear ratio subplots)
+- `examples/run_benchmarks.py` to regenerate the benchmark suite
+
 ### Planned (V2)
 - LLM-based semantic pattern detection
 - Log-normal distribution fitter

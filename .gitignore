@@ -40,6 +40,10 @@ output/recipes/*.md
 output/anchors/*.parquet
 output/profiling_reports/*.html
 
+# Stress test fixtures (regenerable via generate_fake_db.py --n-rows N)
+data/original/users_*.csv
+output/_benchmark_runs/
+
 # Keep the empty directories
 !data/original/.gitkeep
 !data/reconstructed/.gitkeep

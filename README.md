@@ -155,6 +155,13 @@ Side-by-side, original CSV vs compressed payload:
 - Visual fingerprints: DNA (base-4) and RGB (3 bytes/pixel) encodings
 - 80 pytest unit and integration tests, all passing
 
+## Benchmarks
+
+Stress-tested at 1k / 10k / 100k rows. The ratio improves with size as the
+~15 KB fixed-cost recipe amortizes; at 100k `--aggressive-uuid` reaches
+**20.02 : 1** with 100 / 100 fidelity. Full table, scaling plot, and analysis
+in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
 ## Tested on
 
 | Dataset       | Rows   | Size on disk | Default ratio | Aggressive ratio | Fidelity   |
