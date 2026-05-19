@@ -230,6 +230,10 @@ def test_detect_correlation_num_num():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not USERS_CSV.exists(),
+    reason=f"Test fixture missing: {USERS_CSV} (data/ is gitignored, regenerate via examples/)",
+)
 def test_detect_correlation_cat_cat_on_real_users():
     """Sur users.csv, (country, signup_source) doit apparaitre dans les correlations."""
     df = pd.read_csv(USERS_CSV)
@@ -247,6 +251,10 @@ def test_detect_correlation_cat_cat_on_real_users():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not USERS_CSV.exists(),
+    reason=f"Test fixture missing: {USERS_CSV} (data/ is gitignored, regenerate via examples/)",
+)
 def test_build_patterns_on_real_users():
     """build_patterns sur users.csv : 9 patterns, ancres correctes, distributions correctes.
 
