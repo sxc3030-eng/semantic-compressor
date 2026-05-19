@@ -441,7 +441,7 @@ def test_end_to_end_users_csv(tmp_path: Path) -> None:
         - write_recipe ecrit un fichier valide < 50 KB
         - Toutes les sections presentes et parseables JSON
     """
-    csv_path = Path("D:/semantic-compressor/data/original/users.csv")
+    csv_path = Path(__file__).resolve().parent.parent / "data" / "original" / "users.csv"
     if not csv_path.exists():
         pytest.skip(f"users.csv not found at {csv_path}")
 

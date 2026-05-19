@@ -40,7 +40,7 @@ from src.validator import (
 # ---------------------------------------------------------------------------
 
 
-USERS_CSV = Path("D:/semantic-compressor/data/original/users.csv")
+USERS_CSV = Path(__file__).resolve().parent.parent / "data" / "original" / "users.csv"
 
 
 @pytest.fixture

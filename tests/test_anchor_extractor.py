@@ -207,7 +207,7 @@ def test_real_users_csv_anchors_with_profiler(tmp_path: Path) -> None:
     """End-to-end test using the real profiler."""
     from src.profiler import profile_dataframe  # type: ignore[import-not-found]
 
-    csv_path = Path("D:/semantic-compressor/data/original/users.csv")
+    csv_path = Path(__file__).resolve().parent.parent / "data" / "original" / "users.csv"
     assert csv_path.exists(), f"Test fixture missing: {csv_path}"
 
     df = pd.read_csv(csv_path)
@@ -241,7 +241,7 @@ def test_real_users_csv_anchors_manual_profiles(tmp_path: Path) -> None:
     """Same end-to-end shape as test 7 but with hand-crafted profiles, so the
     test runs even when src.profiler doesn't exist yet (parallel agent
     dependency). Verifies the anchor extractor logic on real data."""
-    csv_path = Path("D:/semantic-compressor/data/original/users.csv")
+    csv_path = Path(__file__).resolve().parent.parent / "data" / "original" / "users.csv"
     assert csv_path.exists(), f"Test fixture missing: {csv_path}"
 
     df = pd.read_csv(csv_path)
