@@ -684,10 +684,30 @@ def _choose_strongest_correlation(
     target: str,
     correlations: list[Correlation],
     anchor_set: set[str],
+    profile_index: dict[str, ColumnProfile] | None = None,
     excluded_sources: set[str] | None = None,
 ) -> Correlation | None:
-    """Choisit la correlation la plus forte impliquant `target` avec un partenaire non-ancre."""
+    """Choisit la correlation la plus forte impliquant `target` avec un partenaire non-ancre.
+
+    Resolution de la direction (qui depend de qui) : la colonne avec la PLUS HAUTE
+    cardinalite est consideree comme source (plus informative), et l'autre comme
+    dependante. Cette regle casse les cycles de correlations mutuelles
+    (ex: country<->signup_source) et garantit que les colonnes a haute
+    cardinalite (typiquement les plus biaisees) conservent leur distribution
+    marginale, au lieu d'etre diluees par un conditioning sur une colonne a
+    faible cardinalite.
+
+    En cas d'egalite de cardinalite, on departage par ordre lexicographique
+    sur le nom (target est dependant si target_name > partner_name).
+
+    Si `profile_index` est None, on retombe sur l'ancien comportement (sans
+    resolution de direction) pour compatibilite ascendante.
+    """
     excluded = excluded_sources or set()
+    target_key: tuple[int, str] | None = None
+    if profile_index is not None and target in profile_index:
+        target_key = (profile_index[target].n_unique, target)
+
     best: Correlation | None = None
     for corr in correlations:
         if target == corr.col_a:
@@ -698,6 +718,14 @@ def _choose_strongest_correlation(
             continue
         if partner in anchor_set or partner in excluded:
             continue
+        # Resolution de direction par cardinalite : target ne peut etre dependant
+        # que si sa cardinalite est <= celle du partenaire (sinon target est la
+        # source naturelle, pas le dependant).
+        if target_key is not None and partner in profile_index:
+            partner_key = (profile_index[partner].n_unique, partner)
+            # Strict : target_key doit etre < partner_key.
+            if target_key >= partner_key:
+                continue
         if best is None or corr.strength > best.strength:
             best = corr
     return best
@@ -786,8 +814,10 @@ def build_patterns(
             )
             continue
 
-        # 3. Correlation conditionnelle
-        best_corr = _choose_strongest_correlation(col, correlations, anchor_set)
+        # 3. Correlation conditionnelle (avec resolution de direction par cardinalite)
+        best_corr = _choose_strongest_correlation(
+            col, correlations, anchor_set, profile_index=profile_index
+        )
         if best_corr is not None:
             pivot = best_corr.col_b if best_corr.col_a == col else best_corr.col_a
             try:

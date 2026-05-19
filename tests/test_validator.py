@@ -135,15 +135,20 @@ def test_schema_mismatch_critical_fail(small_df: pd.DataFrame) -> None:
 
 
 def test_ks_test_same_distribution_passes(thresholds: ValidationThresholds) -> None:
-    """Deux samples N(0,1) -> KS-test pass."""
+    """Deux samples N(0,1) -> KS-test pass.
+
+    n=2000 > ks_large_n_threshold => le validator bascule sur D-statistic
+    plutot que p-value. metric='ks_distance' et actual = D <= ks_distance_max.
+    """
     rng = np.random.default_rng(123)
     a = pd.Series(rng.normal(0, 1, size=2000), name="x")
     b = pd.Series(rng.normal(0, 1, size=2000), name="x")
     result = test_distribution_ks(a, b, thresholds)
     assert result.passed is True
-    # actual = p-value
     assert isinstance(result.actual, float)
-    assert result.actual > thresholds.ks_pvalue_min
+    # En large-n mode : actual = D-stat, doit etre <= ks_distance_max
+    assert result.metric == "ks_distance"
+    assert result.actual <= thresholds.ks_distance_max
 
 
 # ---------------------------------------------------------------------------
@@ -152,13 +157,15 @@ def test_ks_test_same_distribution_passes(thresholds: ValidationThresholds) -> N
 
 
 def test_ks_test_different_distribution_fails(thresholds: ValidationThresholds) -> None:
-    """N(0,1) vs N(2,1) -> KS-test fail (p << 0.05)."""
+    """N(0,1) vs N(2,1) -> KS-test fail (D-statistic largement > seuil)."""
     rng = np.random.default_rng(7)
     a = pd.Series(rng.normal(0, 1, size=2000), name="x")
     b = pd.Series(rng.normal(2, 1, size=2000), name="x")
     result = test_distribution_ks(a, b, thresholds)
     assert result.passed is False
-    assert result.actual < 0.05
+    # En large-n mode : actual = D-stat, doit etre > ks_distance_max
+    assert result.metric == "ks_distance"
+    assert result.actual > thresholds.ks_distance_max
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +308,17 @@ def test_perturbed_reconstruction_on_users_csv() -> None:
     # par ligne (on veut juste tester la fidelite statistique des perturbations).
     report = validate(original, reconstructed)
 
-    assert 60.0 <= report.overall_score <= 95.0, (
-        f"Expected score in [60, 95], got {report.overall_score}. "
+    # Apres bascule en mode D-statistic a grand n et skip cat_freq sur datetimes,
+    # ces perturbations modestes (bruit N(0,1) sur age + flip 5% premium) donnent
+    # un score plus haut qu'avant : la borne sup est relachee a 99 (toujours
+    # < 100 -> au moins un test echoue, ce qui prouve que le validator detecte
+    # bien la difference).
+    assert 60.0 <= report.overall_score < 100.0, (
+        f"Expected score in [60, 100), got {report.overall_score}. "
         f"Passed={report.passed_count} Failed={report.failed_count}"
+    )
+    assert report.failed_count >= 1, (
+        f"Expected at least 1 failure on perturbed data, got 0 failures"
     )
 
 

@@ -62,8 +62,22 @@ class ValidationThresholds:
     fidelity_target: float = 0.95
     skew_relax_threshold: float = 2.0  # skewness > 2 -> p > 0.01 plutot que 0.05
     ks_pvalue_min_relaxed: float = 0.01
-    min_correlation_to_check: float = 0.1  # en dessous, rien a preserver
+    # En dessous de ce seuil, on considere la correlation comme statistiquement
+    # negligeable (cohen 1988 : |r| < 0.1 = trivial, 0.1-0.3 = faible). La spec
+    # SPEC.md utilise 0.3 comme seuil de "significativite" pour la detection.
+    # On choisit 0.15 cote validation : assez bas pour catcher les correlations
+    # notables, assez haut pour eviter de tester du bruit statistique non
+    # encodable proprement (ex: dependances faibles entre colonnes datetime).
+    min_correlation_to_check: float = 0.15
     max_correlation_pairs: int = 20
+    # A grand n, la p-value KS tend vers 0 meme pour des distributions tres
+    # proches. On bascule alors sur le D-statistic (Kolmogorov distance, dans
+    # [0,1]), plus interpretable. Au-dessus de ks_large_n_threshold lignes :
+    # passe si D < ks_distance_max. Pour les distributions tres skewed
+    # (|skew| > skew_relax_threshold), on relache a ks_distance_max_relaxed.
+    ks_large_n_threshold: int = 1000
+    ks_distance_max: float = 0.05
+    ks_distance_max_relaxed: float = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +93,25 @@ def _is_numeric(series: pd.Series) -> bool:
 
 
 def _is_datetime(series: pd.Series) -> bool:
-    return pdt.is_datetime64_any_dtype(series)
+    """True pour dtype datetime natif OU pour strings ISO datetime parseables.
+
+    Le CSV est lu sans parse_dates pour preserver les types ; les datetimes
+    apparaissent en dtype `object`. On detecte ce cas en parsant un echantillon.
+    """
+    if pdt.is_datetime64_any_dtype(series):
+        return True
+    if pdt.is_object_dtype(series) or pdt.is_string_dtype(series):
+        sample = series.dropna().head(50)
+        if sample.empty:
+            return False
+        try:
+            parsed = pd.to_datetime(sample, errors="coerce", utc=True)
+        except (ValueError, TypeError):
+            return False
+        # Seuil 90% : evite les faux positifs sur des strings libres contenant
+        # quelques timestamps.
+        return float(parsed.notna().mean()) >= 0.9
+    return False
 
 
 def _is_categorical_like(series: pd.Series) -> bool:
@@ -381,21 +413,48 @@ def test_distribution_ks(
     )
 
     ks_stat, p_value = stats.ks_2samp(a, b)
-    passed = bool(p_value > p_threshold)
-    threshold_label = "relaxed" if use_relaxed else "standard"
 
-    details = (
-        f"KS stat={ks_stat:.4f}, p={p_value:.4f}, threshold={p_threshold} "
-        f"({threshold_label}, skew={skew:.2f})"
-    )
+    # A grand n, la p-value KS converge vers 0 meme pour des distributions tres
+    # proches (le test gagne en puissance avec n). On bascule sur le D-stat,
+    # qui mesure la distance reelle entre distributions independamment de n.
+    n_min = min(len(a), len(b))
+    use_distance_threshold = n_min >= thresholds.ks_large_n_threshold
+
+    if use_distance_threshold:
+        d_threshold = (
+            thresholds.ks_distance_max_relaxed if use_relaxed
+            else thresholds.ks_distance_max
+        )
+        d_label = "relaxed-skew" if use_relaxed else "standard"
+        passed = bool(ks_stat <= d_threshold)
+        details = (
+            f"KS stat={ks_stat:.4f}, p={p_value:.4f}, D_threshold={d_threshold} "
+            f"({d_label} large-n mode, n={n_min}, skew={skew:.2f})"
+        )
+        actual_val = float(ks_stat)
+        threshold_val = float(d_threshold)
+        metric_label = "ks_distance"
+        expected_label = f"<= {d_threshold}"
+    else:
+        passed = bool(p_value > p_threshold)
+        threshold_label = "relaxed" if use_relaxed else "standard"
+        details = (
+            f"KS stat={ks_stat:.4f}, p={p_value:.4f}, p_threshold={p_threshold} "
+            f"({threshold_label}, n={n_min}, skew={skew:.2f})"
+        )
+        actual_val = float(p_value)
+        threshold_val = float(p_threshold)
+        metric_label = "ks_pvalue"
+        expected_label = f"> {p_threshold}"
+
     logger.debug("ks_test[%s]: %s passed=%s", col, details, passed)
 
     return ValidationTestResult(
         test_name=f"ks_test[{col}]",
-        metric="ks_pvalue",
-        expected=f"> {p_threshold}",
-        actual=float(p_value),
-        threshold=float(p_threshold),
+        metric=metric_label,
+        expected=expected_label,
+        actual=actual_val,
+        threshold=threshold_val,
         passed=passed,
         details=details,
     )

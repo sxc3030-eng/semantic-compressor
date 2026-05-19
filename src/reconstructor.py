@@ -531,8 +531,11 @@ def _find_bucket(buckets: list[dict[str, Any]], source_value: Any) -> dict[str, 
     for bucket in buckets:
         if str(bucket.get("bucket_value")) == str(source_value):
             return bucket
-    # Nouvelle categorie : fallback bucket 0.
-    logger.warning(
+    # Nouvelle categorie : fallback bucket 0. C'est attendu quand la colonne
+    # source genere une valeur non vue dans les buckets training : on log en
+    # DEBUG plutot que WARNING pour ne pas polluer le run normal (peut arriver
+    # legitimement quand le pivot est tire d'une distribution categorielle).
+    logger.debug(
         "Conditional bucket: category %r not found, falling back to bucket 0",
         source_value,
     )
