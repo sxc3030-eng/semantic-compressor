@@ -1,0 +1,25 @@
+# Core data manipulation
+pandas>=2.2,<3
+numpy>=1.26,<3
+pyarrow>=15
+
+# Database engine (rapid queries on profiled data)
+duckdb>=1.0
+
+# Schemas / validation
+pydantic>=2.6
+
+# Statistical tests (KS, Shapiro-Wilk, Pearson, ANOVA, distribution fitting)
+scipy>=1.11
+
+# Profiling (initial exploration + structured profile extraction)
+ydata-profiling>=4.10
+
+# Fake data generator for the test database
+faker>=22
+
+# Console output (tables, progress bars)
+rich>=13
+
+# Testing
+pytest>=8

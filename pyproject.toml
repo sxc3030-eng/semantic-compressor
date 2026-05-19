@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semantic-compressor"
+version = "0.1.0"
+description = "Proof of concept: compress a database into a human-readable recipe + minimal anchors, regenerate with statistical fidelity."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "semantic-compressor POC" }]
+dependencies = [
+    "pandas>=2.2,<3",
+    "numpy>=1.26,<3",
+    "pyarrow>=15",
+    "duckdb>=1.0",
+    "pydantic>=2.6",
+    "scipy>=1.11",
+    "ydata-profiling>=4.10",
+    "faker>=22",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+semantic-compressor = "src.orchestrator:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.semantic_compressor]
+# Default thresholds (used by validator)
+ks_pvalue_min = 0.05
+mean_tolerance_pct = 0.02
+correlation_tolerance = 0.05
+categorical_freq_tolerance = 0.03
+fidelity_target = 0.95
+compression_ratio_min = 5.0
+compression_ratio_target = 10.0

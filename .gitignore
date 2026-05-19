@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated POC data (kept out of repo, regenerable via examples/)
+data/original/*.csv
+data/original/*.parquet
+data/reconstructed/*.csv
+data/reconstructed/*.parquet
+output/recipes/*.md
+output/anchors/*.parquet
+output/profiling_reports/*.html
+
+# Keep the empty directories
+!data/original/.gitkeep
+!data/reconstructed/.gitkeep
+!output/recipes/.gitkeep
+!output/anchors/.gitkeep
+
+# Logs
+*.log
+
+# Misc
+*.tmp
