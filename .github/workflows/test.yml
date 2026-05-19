@@ -52,6 +52,13 @@ jobs:
           python --version
           python -m pip list
 
+      - name: Generate test fixture (data/original/users.csv)
+        # The 10k-row synthetic users.csv is regenerable from seed=42 and is
+        # gitignored. Several tests load it as the canonical fixture, so we
+        # produce it here before pytest runs. Deterministic: same seed = same bytes.
+        run: |
+          python examples/generate_fake_db.py --n-rows 10000 --seed 42
+
       - name: Run pytest with coverage
         run: |
           python -m pytest \
