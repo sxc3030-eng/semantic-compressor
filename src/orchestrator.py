@@ -75,6 +75,7 @@ class CompressionResult:
     n_columns: int
     anchor_columns: list[str]
     n_patterns: int
+    html_profile_path: Path | None = None
 
 
 @dataclass
@@ -183,6 +184,33 @@ def _extract_random_format_columns_from_recipe(recipe: Recipe) -> dict[str, str]
     return out
 
 
+def _normalize_anchor_columns_for_validation(
+    anchor_columns: list[str],
+) -> list[str]:
+    """Remplace les ancres synthetiques EMAIL_SPLIT (`*__local`, `*__domain_idx`)
+    par leur colonne racine pour la validation.
+
+    Les ancres EMAIL_SPLIT n'existent que dans le parquet d'ancres. Pour le test
+    `anchor_exact` du validator, qui compare original (CSV brut) vs reconstruit
+    (CSV brut), on remappe vers la colonne email originale (qui doit etre
+    losslessly identique apres reconstruction).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for col in anchor_columns:
+        root: str
+        if col.endswith("__local"):
+            root = col[: -len("__local")]
+        elif col.endswith("__domain_idx"):
+            root = col[: -len("__domain_idx")]
+        else:
+            root = col
+        if root not in seen:
+            out.append(root)
+            seen.add(root)
+    return out
+
+
 def _build_validation_tests(
     profiles: list[ColumnProfile], n_rows: int
 ) -> list[dict[str, Any]]:
@@ -223,6 +251,7 @@ def compress(
     parquet_codec: str = "zstd",
     parquet_compression_level: int | None = 22,
     generate_html_profile: bool = False,
+    aggressive_uuid: bool = False,
 ) -> CompressionResult:
     """Pipeline complet de compression CSV -> (recipe.md, anchors.parquet).
 
@@ -238,6 +267,11 @@ def compress(
         parquet_codec: codec de compression parquet (zstd / snappy / gzip / brotli).
         parquet_compression_level: niveau de compression (22 = max zstd ; ignore par snappy).
         generate_html_profile: si True, genere aussi le rapport ydata-profiling.
+        aggressive_uuid: si True, force les colonnes UUID v4 dont le nom ressemble
+            a un id (id, uuid, *_id, *_uuid, etc.) a etre marquees RANDOM_FORMAT
+            (gain de compression ~3-5x sur ces colonnes au prix de la
+            preservation de la valeur exacte des ids). Defaut False : on
+            preserve les ids comme ANCHOR_DIRECT (mode fidelity-first).
 
     Returns:
         CompressionResult avec metriques et chemins de sortie.
@@ -269,13 +303,22 @@ def compress(
     profiles = profile_dataframe(df, table_name=table_name)
 
     # 2b. Optionnel : rapport HTML d'exploration.
+    # Si la generation echoue (timeout, version Python incompatible, etc.), on
+    # log un warning mais on continue le pipeline : la compression elle-meme ne
+    # doit jamais etre bloquee par un echec du profiler exterieur.
+    html_profile_path: Path | None = None
     if generate_html_profile:
+        html_target = output_dir / "profiling_reports" / f"{table_name}.html"
         try:
-            html_path = output_dir / "profiling_reports" / f"{table_name}_profile.html"
-            generate_html_report(df, html_path, minimal=True)
-            logger.info("  HTML profile written to %s", html_path)
+            generate_html_report(df, html_target, minimal=True)
+            html_profile_path = html_target
+            logger.info("  HTML profile written to %s", html_profile_path)
         except Exception as exc:
-            logger.warning("HTML profile generation failed: %s", exc)
+            logger.warning(
+                "HTML profile generation failed (%s); skipping (pipeline continues)",
+                exc,
+            )
+            html_profile_path = None
 
     # 3. Resolution de la dependance cyclique anchors <-> patterns en triple passe.
     # Pass 1 : ancres heuristiques (cardinalite stricte + manuelles).
@@ -297,11 +340,14 @@ def compress(
         df, profiles,
         anchor_columns=prelim_anchor_cols,
         manual_random_format_columns=manual_random_format_columns,
+        aggressive_uuid=aggressive_uuid,
     )
     logger.info("  pass 2 (patterns): %d patterns built", len(patterns))
 
-    # Pass 3 : ancres finales. Les patterns RANDOM_FORMAT excluent les colonnes
-    # concernees des ancres (via extract_anchors qui regarde patterns).
+    # Pass 3 : ancres finales. Les patterns RANDOM_FORMAT et EMAIL_SPLIT
+    # excluent les colonnes concernees des ancres (via extract_anchors qui
+    # regarde patterns). Pour EMAIL_SPLIT, des colonnes synthetiques
+    # `<col>__local` et `<col>__domain_idx` sont ajoutees a la place.
     final_anchors_df, final_anchor_cols = extract_anchors(
         df, profiles,
         patterns=patterns,
@@ -313,15 +359,24 @@ def compress(
     # Si pass 3 a ajoute des ancres par rapport a pass 1, on doit reconstruire les
     # patterns avec cette nouvelle liste pour eviter qu'une colonne soit a la fois
     # ancre ET avec un pattern non-ancre (qui aurait priorite sur l'ANCHOR_DIRECT).
-    if set(final_anchor_cols) != set(prelim_anchor_cols):
+    # Note : on filtre les colonnes synthetiques EMAIL_SPLIT (`*__local`,
+    # `*__domain_idx`) du test d'egalite : elles sont AJOUTEES par extract_anchors
+    # mais ne sont PAS des candidates ancres dans le df d'origine, leur presence
+    # ne doit pas declencher une rebuild des patterns.
+    final_real_anchors = [
+        c for c in final_anchor_cols
+        if not (c.endswith("__local") or c.endswith("__domain_idx"))
+    ]
+    if set(final_real_anchors) != set(prelim_anchor_cols):
         logger.info(
             "  anchor set changed between pass 1 and pass 3 (%s -> %s); rebuilding patterns",
-            prelim_anchor_cols, final_anchor_cols,
+            prelim_anchor_cols, final_real_anchors,
         )
         patterns = build_patterns(
             df, profiles,
-            anchor_columns=final_anchor_cols,
+            anchor_columns=final_real_anchors,
             manual_random_format_columns=manual_random_format_columns,
+            aggressive_uuid=aggressive_uuid,
         )
 
     anchor_path = output_dir / "anchors" / f"{table_name}_anchors.parquet"
@@ -410,6 +465,7 @@ def compress(
         n_columns=n_columns,
         anchor_columns=final_anchor_cols,
         n_patterns=len(patterns),
+        html_profile_path=html_profile_path,
     )
 
 
@@ -525,9 +581,19 @@ def validate_pair(
         anchor_columns = _detect_unique_anchor_columns(original)
         logger.info("  auto-detected anchor columns: %s", anchor_columns)
 
+    # Normalisation EMAIL_SPLIT : les ancres synthetiques `*__local` et
+    # `*__domain_idx` sont remappees vers leur colonne racine (email originale)
+    # pour le test `anchor_exact` qui compare des colonnes CSV.
+    normalized_anchors = _normalize_anchor_columns_for_validation(anchor_columns)
+    if normalized_anchors != anchor_columns:
+        logger.info(
+            "  normalized anchor columns for validation: %s -> %s",
+            anchor_columns, normalized_anchors,
+        )
+
     report = validate(
         original, reconstructed,
-        anchor_columns=anchor_columns,
+        anchor_columns=normalized_anchors,
         random_format_columns=random_format_columns,
     )
     elapsed = time.perf_counter() - t0
@@ -706,6 +772,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also generate an HTML profile with ydata-profiling.",
     )
+    p_compress.add_argument(
+        "--aggressive-uuid",
+        action="store_true",
+        help=(
+            "Force UUID v4 columns with id-like names (id, uuid, *_id, *_uuid, ...) "
+            "to be RANDOM_FORMAT (not preserved). Default: keep them as ANCHOR_DIRECT "
+            "to preserve FK references. Use this to gain ~3-5x compression on id columns "
+            "when exact id preservation is not required (synthetic data, audit logs, etc.)."
+        ),
+    )
 
     # --- decompress ---
     p_decompress = subparsers.add_parser(
@@ -786,6 +862,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "Typical use: password_hash."
         ),
     )
+    p_run.add_argument(
+        "--aggressive-uuid",
+        action="store_true",
+        help=(
+            "Force UUID v4 columns with id-like names (id, uuid, *_id, *_uuid, ...) "
+            "to be RANDOM_FORMAT. See compress --help."
+        ),
+    )
 
     return parser
 
@@ -812,6 +896,7 @@ def _cmd_compress(args: argparse.Namespace) -> int:
         parquet_codec=args.codec,
         parquet_compression_level=args.level,
         generate_html_profile=args.generate_html_profile,
+        aggressive_uuid=getattr(args, "aggressive_uuid", False),
     )
 
     console = Console()
@@ -892,6 +977,7 @@ def _cmd_run_poc(args: argparse.Namespace) -> int:
         manual_random_format_columns=random_format,
         parquet_codec=args.codec,
         parquet_compression_level=args.level,
+        aggressive_uuid=getattr(args, "aggressive_uuid", False),
     )
     console.print(
         f"  -> recipe {compress_result.recipe_path}, anchors {compress_result.anchor_path}"

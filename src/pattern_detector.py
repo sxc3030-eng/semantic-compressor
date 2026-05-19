@@ -727,24 +727,77 @@ def _parse_hex_hash(sample_value: str) -> dict[str, Any]:
     }
 
 
+#: Regex strict de detection d'un UUID v4 RFC 4122 :
+#: - 8 hex / 4 hex / 4 hex (commence par "4" = version 4) / 4 hex (commence par
+#:   [89ab] = variant 10xx) / 12 hex.
+_UUID_V4_REGEX_STR = (
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+
+#: Regex compilee pour identifier les colonnes dont le NOM ressemble a un id
+#: user-facing (preserve typiquement pour les FK). Ces colonnes restent
+#: ANCHOR_DIRECT par defaut meme si leur contenu matche un format aleatoire :
+#: la valeur exacte de l'id porte de l'information (correspondance FK).
+#: L'utilisateur peut forcer l'auto-detection RANDOM_FORMAT via le flag
+#: `aggressive_uuid` (CLI : --aggressive-uuid).
+_ID_LIKE_COLUMN_NAME_REGEX = re.compile(
+    r"^(id|uuid|uid|pk|.*_id|.*_uuid|.*_uid|.*_pk)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_uuid_v4(sample_value: str) -> dict[str, Any]:
+    """Parse une chaine UUID v4 (RFC 4122) et extrait son format spec.
+
+    Format attendu : `xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx` (36 chars,
+    minuscules). Le `body_type=uuid_v4` est consomme specialement par
+    `generate_random_format_value` (cf. reconstructor) qui regenere des UUIDs
+    valides avec les bits de version/variant corrects.
+    """
+    if not re.match(_UUID_V4_REGEX_STR, sample_value):
+        raise ValueError(f"Not a UUID v4 value: {sample_value!r}")
+    return {
+        "prefix": "",
+        "suffix": "",
+        "body_type": "uuid_v4",
+        "body_length": 36,
+        "regex": _UUID_V4_REGEX_STR,
+    }
+
+
 #: Catalogue des formats aleatoires reconnus automatiquement par
 #: `detect_random_format`. Une entree par format ; chaque entree contient :
 #: - `regex` : pattern de matching utilise pour valider qu'une serie complete
 #:   colle a ce format (verifie au moins 95% des valeurs)
 #: - `extract_format` : fonction (sample_value) -> format_spec dict
 #:
-#: UUID v4 et email ne sont volontairement PAS dans ce catalogue : `id` doit
-#: rester ancre direct (preserve la valeur exacte) et `email` aussi (c'est une
-#: identite user-facing). L'utilisateur peut forcer manuellement via le
-#: parametre `manual_random_format_columns` de `build_patterns` si besoin.
+#: UUID v4 est dans ce catalogue, MAIS avec un garde-fou cote `build_patterns`:
+#: les colonnes dont le NOM correspond a `_ID_LIKE_COLUMN_NAME_REGEX` (id, uuid,
+#: *_id, *_uuid, etc.) restent ANCHOR_DIRECT par defaut (preservation des FK).
+#: Pour passer outre, utiliser le flag `aggressive_uuid=True` qui force
+#: l'auto-detection meme sur ces colonnes (l'orchestrator l'expose via
+#: --aggressive-uuid : on accepte alors que la valeur exacte de l'id change
+#: entre runs).
+#:
+#: Email n'est PAS dans ce catalogue : on le traite via le mecanisme dedie
+#: EMAIL_SPLIT (lossless : preserve local_part + domain_dict, voir
+#: `detect_email_split`).
 KNOWN_RANDOM_FORMATS: dict[str, dict[str, Any]] = {
     "bcrypt_hash": {
         "regex": re.compile(r"^\$bcrypt\$\d+[a-z]?\$\d+\$[0-9a-f]+\$$"),
         "extract_format": _parse_bcrypt,
     },
+    "uuid_v4_anchor": {
+        # Format strict RFC 4122 v4. La regenaration se fait via uuid_v4 body
+        # type qui force les bits version/variant corrects.
+        "regex": re.compile(_UUID_V4_REGEX_STR),
+        "extract_format": _parse_uuid_v4,
+    },
     "hex_hash": {
         # On exige une longueur >= 32 pour eviter de matcher des UUIDs courts
         # ou des prefixes hex. Pas de borne sup pour les SHA-512 etc.
+        # Ordre : place APRES uuid_v4 pour que les UUIDs (qui contiennent des
+        # tirets) soient testes d'abord et matches par uuid_v4.
         "regex": re.compile(r"^[0-9a-f]{32,128}$"),
         "extract_format": _parse_hex_hash,
     },
@@ -795,6 +848,78 @@ def detect_random_format(
                         )
                         break  # passe au format suivant
     return None
+
+
+# ---------------------------------------------------------------------------
+# 4c. Detection des colonnes EMAIL splittables en local_part + domain_dict
+# ---------------------------------------------------------------------------
+
+
+#: Regex permissive pour valider qu'une chaine ressemble a un email :
+#: `local_part@domain.tld` avec un seul "@". On ne tente pas d'etre RFC-compliant,
+#: juste suffisamment strict pour eviter les faux positifs (URLs, etc.).
+_EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def detect_email_split(
+    series: pd.Series,
+    *,
+    min_match_ratio: float = 0.95,
+    max_dict_size: int = 256,
+) -> dict[str, Any] | None:
+    """Detecte si une colonne string peut etre splittee en local_part + domain dict.
+
+    Conditions :
+    - >= `min_match_ratio` des valeurs non-nulles matchent `_EMAIL_REGEX`
+    - le dictionnaire des domaines distincts a une taille <= `max_dict_size`
+      (typique : 5-10 entrees pour un dataset de 10k emails sur 2-3 providers)
+
+    Retourne un dict :
+        {
+            "separator": "@",
+            "domain_dict": ["example.com", "example.net", ...],
+        }
+    Ou None si les conditions ne sont pas remplies.
+
+    Le `domain_dict` est trie alphabetiquement (deterministe inter-process).
+    L'index dans le dict sert ensuite a stocker la colonne `<col>__domain_idx`
+    en uint8/uint16 dans le parquet d'ancres.
+    """
+    cleaned = series.dropna()
+    if cleaned.empty:
+        return None
+    str_series = cleaned.astype(str)
+    matches_mask = str_series.str.match(_EMAIL_REGEX, na=False)
+    match_ratio = float(matches_mask.mean())
+    if match_ratio < min_match_ratio:
+        logger.debug(
+            "detect_email_split: column %r match_ratio=%.3f < %.3f, skipping",
+            series.name, match_ratio, min_match_ratio,
+        )
+        return None
+
+    # Extrait les domaines via split sur "@". On ne garde que les emails valides.
+    matching_emails = str_series[matches_mask]
+    # str.rsplit("@", 1) plus robuste si jamais un local_part contenait "@" (rare).
+    domains = matching_emails.str.rsplit("@", n=1).str[-1]
+    distinct_domains = sorted(domains.unique().tolist())
+
+    if len(distinct_domains) > max_dict_size:
+        logger.debug(
+            "detect_email_split: column %r has %d distinct domains > max_dict_size=%d, skipping",
+            series.name, len(distinct_domains), max_dict_size,
+        )
+        return None
+
+    logger.info(
+        "detect_email_split: column %r matches email pattern "
+        "(match_ratio=%.3f, %d distinct domains)",
+        series.name, match_ratio, len(distinct_domains),
+    )
+    return {
+        "separator": "@",
+        "domain_dict": distinct_domains,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -858,13 +983,22 @@ def build_patterns(
     profiles: list[ColumnProfile],
     anchor_columns: list[str],
     manual_random_format_columns: list[str] | None = None,
+    aggressive_uuid: bool = False,
 ) -> list[Pattern]:
     """Pipeline de detection complet : combine FD + distributions + correlations en list[Pattern].
 
     Resolution des conflits (par ordre de priorite pour chaque colonne) :
-    0. Colonne dans `manual_random_format_columns` OU dans `anchor_columns` ET
-       detectee automatiquement comme format aleatoire connu -> RANDOM_FORMAT
-       (la valeur n'est PAS stockee comme ancre, on regenere au runtime).
+    0a. Colonne dans `manual_random_format_columns` OU dans `anchor_columns` ET
+        detectee automatiquement comme format aleatoire connu -> RANDOM_FORMAT
+        (la valeur n'est PAS stockee comme ancre, on regenere au runtime).
+        EXCEPTION : si le format detecte est `uuid_v4_anchor` et que le NOM de
+        la colonne matche `_ID_LIKE_COLUMN_NAME_REGEX` (id/uuid/*_id/etc.), on
+        IGNORE la detection et on garde la colonne en ANCHOR_DIRECT pour
+        preserver la valeur exacte de l'id (FK potentielles). Override via
+        `aggressive_uuid=True`.
+    0b. Colonne email (auto-detectee) -> EMAIL_SPLIT (encodage lossless, split
+        local_part + domain index ; les anchors contiennent 2 colonnes splittees
+        au lieu de la colonne email).
     1. Colonne dans `anchor_columns` -> ANCHOR_DIRECT
     2. Dependance fonctionnelle A -> B (B == colonne courante, A != colonne courante) -> FUNCTIONAL_DEP
     3. Correlation forte avec une autre colonne non-ancre -> CONDITIONAL_DISTRIBUTION
@@ -877,13 +1011,18 @@ def build_patterns(
         manual_random_format_columns: liste de colonnes a forcer en RANDOM_FORMAT
             (la detection automatique ne marque PAS ces colonnes par defaut sauf
             si elles matchent un format de `KNOWN_RANDOM_FORMATS`).
+        aggressive_uuid: si True, les colonnes dont le nom ressemble a un id
+            (id, uuid, *_id, *_uuid, etc.) sont aussi auto-marquees RANDOM_FORMAT
+            si leur contenu est un UUID v4. Par defaut False : on preserve la
+            valeur exacte de ces colonnes (mode "fidelity-first" pour FK).
     """
     logger.info(
-        "build_patterns: %d cols (%d ancres), %d rows, manual_random_format=%s",
+        "build_patterns: %d cols (%d ancres), %d rows, manual_random_format=%s, aggressive_uuid=%s",
         df.shape[1],
         len(anchor_columns),
         df.shape[0],
         manual_random_format_columns or [],
+        aggressive_uuid,
     )
     anchor_set = set(anchor_columns)
     manual_random_set = set(manual_random_format_columns or [])
@@ -898,6 +1037,7 @@ def build_patterns(
     # automatique : si le format n'est pas reconnu on log un warning et on
     # retombe sur le comportement par defaut.
     random_format_specs: dict[str, dict[str, Any]] = {}
+    email_split_specs: dict[str, dict[str, Any]] = {}
     for col in df.columns:
         profile = profile_index.get(col)
         # Eligibilite a l'auto-detection : la colonne doit etre unique ou
@@ -908,15 +1048,31 @@ def build_patterns(
             and profile.n_total > 0
             and (profile.n_unique / profile.n_total) >= 0.95
         )
+        name_looks_like_id = bool(_ID_LIKE_COLUMN_NAME_REGEX.match(col))
 
         # Detection auto sur les colonnes a haute cardinalite (peut etre ancre
         # ou non, peu importe : si ca matche un format connu on le marque).
         if is_high_cardinality or col in anchor_set:
             spec = detect_random_format(df[col])
             if spec is not None:
-                random_format_specs[col] = spec
-                logger.info("  column %r auto-detected as RANDOM_FORMAT (%s)", col, spec.get("detected_as"))
-                continue
+                # Garde-fou UUID-as-id : si le format detecte est uuid_v4 et que
+                # le nom de la colonne ressemble a un id (id, uuid, *_id, ...),
+                # on prefere preserver la valeur exacte (FK potentielles).
+                # Override via aggressive_uuid=True.
+                if (
+                    spec.get("detected_as") == "uuid_v4_anchor"
+                    and name_looks_like_id
+                    and not aggressive_uuid
+                ):
+                    logger.info(
+                        "  column %r matches uuid_v4 format but name looks like id, "
+                        "keeping ANCHOR_DIRECT (use aggressive_uuid=True to force RANDOM_FORMAT)",
+                        col,
+                    )
+                else:
+                    random_format_specs[col] = spec
+                    logger.info("  column %r auto-detected as RANDOM_FORMAT (%s)", col, spec.get("detected_as"))
+                    continue
         # Forcage manuel : on tente quand meme de detecter le format pour extraire
         # le spec. Si la detection echoue (format inconnu), on log un warning et
         # on retombe sur le comportement par defaut pour cette colonne.
@@ -925,11 +1081,27 @@ def build_patterns(
             if spec is not None:
                 random_format_specs[col] = spec
                 logger.info("  column %r forced as RANDOM_FORMAT (%s)", col, spec.get("detected_as"))
+                continue
             else:
                 logger.warning(
                     "  column %r is in manual_random_format_columns but no known format matches; "
                     "falling back to default behavior",
                     col,
+                )
+
+        # Detection EMAIL_SPLIT : on tente sur les colonnes a haute cardinalite
+        # qui ne sont PAS deja marquees random_format. La detection verifie
+        # que >= 95% des valeurs matchent un format email et que le nombre de
+        # domaines distincts est borne (<=256, suffisant pour la plupart des
+        # datasets B2C / B2B).
+        if is_high_cardinality or col in anchor_set:
+            email_spec = detect_email_split(df[col])
+            if email_spec is not None:
+                email_split_specs[col] = email_spec
+                logger.info(
+                    "  column %r auto-detected as EMAIL_SPLIT (%d domains: %s)",
+                    col, len(email_spec["domain_dict"]),
+                    email_spec["domain_dict"][:5],
                 )
 
     # 1. Pre-compute dependances fonctionnelles, distributions, correlations.
@@ -951,7 +1123,7 @@ def build_patterns(
     for col in df.columns:
         profile = profile_index.get(col)
 
-        # 0. Random format : la colonne a une valeur unique mais sa valeur exacte
+        # 0a. Random format : la colonne a une valeur unique mais sa valeur exacte
         # n'est pas informative (ex: bcrypt hash). On stocke uniquement le format
         # dans la recette ; pas d'ancre, pas de cardinalite preservee.
         if col in random_format_specs:
@@ -960,6 +1132,22 @@ def build_patterns(
                     column=col,
                     pattern_type=PatternType.RANDOM_FORMAT,
                     format_spec=random_format_specs[col],
+                    fidelity_estimate=1.0,
+                    dependencies=[],
+                )
+            )
+            continue
+
+        # 0b. EMAIL_SPLIT : encodage lossless. La colonne email est splittee en
+        # local_part (ancre texte) + domain_index (ancre uint8 via dictionnaire).
+        # La reconstruction recompose `local_part + "@" + domain_dict[idx]`. Le
+        # `format_spec.domain_dict` est embarque dans la recette.
+        if col in email_split_specs:
+            patterns.append(
+                Pattern(
+                    column=col,
+                    pattern_type=PatternType.EMAIL_SPLIT,
+                    format_spec=email_split_specs[col],
                     fidelity_estimate=1.0,
                     dependencies=[],
                 )
@@ -1101,6 +1289,7 @@ __all__ = [
     "detect_correlations",
     "detect_conditional_distributions",
     "detect_random_format",
+    "detect_email_split",
     "KNOWN_RANDOM_FORMATS",
     "build_patterns",
 ]

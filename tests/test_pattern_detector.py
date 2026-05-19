@@ -250,9 +250,9 @@ def test_detect_correlation_cat_cat_on_real_users():
 def test_build_patterns_on_real_users():
     """build_patterns sur users.csv : 9 patterns, ancres correctes, distributions correctes.
 
-    Note : `password_hash` est auto-detecte comme RANDOM_FORMAT (bcrypt) par
-    `build_patterns` depuis l'ajout du pattern type RANDOM_FORMAT. `id` et
-    `email` restent ANCHOR_DIRECT.
+    Note : `password_hash` est auto-detecte comme RANDOM_FORMAT (bcrypt). `email`
+    est auto-detecte comme EMAIL_SPLIT (3 domaines distincts dans users.csv).
+    `id` reste ANCHOR_DIRECT par defaut (UUID v4 + nom id-like = preservation).
     """
     df = pd.read_csv(USERS_CSV)
     profiles = _users_profiles(df)
@@ -265,12 +265,18 @@ def test_build_patterns_on_real_users():
     assert len(patterns) == 9, f"Expected 9 patterns, got {len(patterns)}"
     assert set(by_col.keys()) == set(df.columns)
 
-    # Ancres : id et email restent ANCHOR_DIRECT. password_hash est
-    # automatiquement detecte comme RANDOM_FORMAT (bcrypt-like).
-    for anchor in ("id", "email"):
-        assert by_col[anchor].pattern_type == PatternType.ANCHOR_DIRECT, (
-            f"{anchor} should be ANCHOR_DIRECT, got {by_col[anchor].pattern_type}"
-        )
+    # id reste ANCHOR_DIRECT (UUID v4 + nom 'id' = guard actif sans aggressive_uuid).
+    assert by_col["id"].pattern_type == PatternType.ANCHOR_DIRECT, (
+        f"id should be ANCHOR_DIRECT, got {by_col['id'].pattern_type}"
+    )
+    # email est EMAIL_SPLIT (3 domaines distincts dans users.csv).
+    assert by_col["email"].pattern_type == PatternType.EMAIL_SPLIT, (
+        f"email should be EMAIL_SPLIT, got {by_col['email'].pattern_type}"
+    )
+    assert by_col["email"].format_spec is not None
+    assert by_col["email"].format_spec["separator"] == "@"
+    assert len(by_col["email"].format_spec["domain_dict"]) >= 1
+    # password_hash est RANDOM_FORMAT (bcrypt-like).
     assert by_col["password_hash"].pattern_type == PatternType.RANDOM_FORMAT, (
         f"password_hash should be RANDOM_FORMAT (bcrypt auto-detected), "
         f"got {by_col['password_hash'].pattern_type}"
@@ -391,11 +397,15 @@ def test_detect_bcrypt_format():
     assert pat.match(values[0]), f"Regex {spec['regex']!r} should match {values[0]!r}"
 
 
-def test_random_format_uuid_not_auto():
-    """Une serie d'UUIDs ne doit PAS etre detectee comme RANDOM_FORMAT par defaut.
+def test_random_format_uuid_detected_as_format():
+    """Une serie d'UUIDs v4 est detectee par `detect_random_format` au niveau de
+    la *primitive* (KNOWN_RANDOM_FORMATS contient uuid_v4_anchor depuis l'ajout
+    de l'option --aggressive-uuid).
 
-    UUID est volontairement absent de KNOWN_RANDOM_FORMATS : `id` (UUID dans
-    users.csv) doit rester ancre direct, pas regenere.
+    Le garde-fou "id-like column name -> reste ANCHOR_DIRECT" est applique au
+    niveau de `build_patterns`, pas dans `detect_random_format` qui est une
+    primitive bas-niveau. Cf. `test_uuid_with_id_name_stays_anchor` pour le test
+    de garde-fou.
     """
     from src.pattern_detector import detect_random_format
     import uuid
@@ -404,7 +414,152 @@ def test_random_format_uuid_not_auto():
     series = pd.Series(values, name="id")
 
     spec = detect_random_format(series)
-    assert spec is None, (
-        f"UUID should NOT be auto-detected as RANDOM_FORMAT (would break "
-        f"anchor preservation for `id` column). Got spec={spec}"
+    assert spec is not None, (
+        f"UUID v4 should be detected by detect_random_format. Got spec={spec}"
     )
+    assert spec["body_type"] == "uuid_v4"
+    assert spec["body_length"] == 36
+    assert spec.get("detected_as") == "uuid_v4_anchor"
+
+
+def test_uuid_with_id_name_stays_anchor():
+    """build_patterns ne marque PAS une colonne `id` UUID comme RANDOM_FORMAT
+    par defaut (aggressive_uuid=False), pour preserver la valeur exacte de
+    l'id (FK potentielles).
+    """
+    import uuid
+    from src.pattern_detector import build_patterns
+
+    values = [str(uuid.uuid4()) for _ in range(200)]
+    df = pd.DataFrame({"id": values, "name": ["alice", "bob"] * 100})
+    profiles = [
+        _make_profile("id", ColumnType.STRING, df["id"], is_anchor_candidate=True),
+        _make_profile("name", ColumnType.CATEGORICAL, df["name"]),
+    ]
+    patterns = build_patterns(df, profiles, anchor_columns=["id"])
+    by_col = {p.column: p for p in patterns}
+
+    assert by_col["id"].pattern_type == PatternType.ANCHOR_DIRECT, (
+        f"id should stay ANCHOR_DIRECT (default mode), got {by_col['id'].pattern_type}"
+    )
+
+
+def test_aggressive_uuid_forces_random_format():
+    """Avec aggressive_uuid=True, une colonne `id` UUID DOIT etre marquee
+    RANDOM_FORMAT meme si son nom ressemble a un id.
+    """
+    import uuid
+    from src.pattern_detector import build_patterns
+
+    values = [str(uuid.uuid4()) for _ in range(200)]
+    df = pd.DataFrame({"id": values, "name": ["alice", "bob"] * 100})
+    profiles = [
+        _make_profile("id", ColumnType.STRING, df["id"], is_anchor_candidate=True),
+        _make_profile("name", ColumnType.CATEGORICAL, df["name"]),
+    ]
+    patterns = build_patterns(
+        df, profiles, anchor_columns=["id"], aggressive_uuid=True
+    )
+    by_col = {p.column: p for p in patterns}
+
+    assert by_col["id"].pattern_type == PatternType.RANDOM_FORMAT, (
+        f"id with aggressive_uuid=True should be RANDOM_FORMAT, got {by_col['id'].pattern_type}"
+    )
+    assert by_col["id"].format_spec is not None
+    assert by_col["id"].format_spec["body_type"] == "uuid_v4"
+
+
+def test_uuid_in_non_id_column_auto_random_format():
+    """Une colonne UUID v4 dont le nom ne ressemble PAS a un id (ex: `token`,
+    `session_key`, etc.) est auto-marquee RANDOM_FORMAT meme sans aggressive_uuid.
+    """
+    import uuid
+    from src.pattern_detector import build_patterns
+
+    values = [str(uuid.uuid4()) for _ in range(200)]
+    df = pd.DataFrame({"token": values, "name": ["alice", "bob"] * 100})
+    profiles = [
+        _make_profile("token", ColumnType.STRING, df["token"], is_anchor_candidate=True),
+        _make_profile("name", ColumnType.CATEGORICAL, df["name"]),
+    ]
+    patterns = build_patterns(df, profiles, anchor_columns=["token"])
+    by_col = {p.column: p for p in patterns}
+
+    assert by_col["token"].pattern_type == PatternType.RANDOM_FORMAT, (
+        f"token should be RANDOM_FORMAT (no id-like guard), got {by_col['token'].pattern_type}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# EMAIL_SPLIT detection tests
+# ---------------------------------------------------------------------------
+
+
+def test_email_split_detection():
+    """Une serie d'emails avec peu de domaines distincts doit etre detectee
+    comme EMAIL_SPLIT par `detect_email_split`.
+    """
+    from src.pattern_detector import detect_email_split
+
+    rng = np.random.default_rng(0)
+    domains = ["example.com", "example.net", "example.org"]
+    emails = [
+        f"user{i}@{rng.choice(domains)}" for i in range(500)
+    ]
+    series = pd.Series(emails, name="email")
+
+    spec = detect_email_split(series)
+    assert spec is not None, "Expected email split detection to succeed"
+    assert spec["separator"] == "@"
+    assert set(spec["domain_dict"]) == set(domains), (
+        f"domain_dict should contain {domains}, got {spec['domain_dict']}"
+    )
+    # Verifie l'ordre alphabetique deterministe.
+    assert spec["domain_dict"] == sorted(spec["domain_dict"])
+
+
+def test_email_split_skips_too_many_domains():
+    """Si le nombre de domaines distincts depasse max_dict_size, on retourne None.
+    """
+    from src.pattern_detector import detect_email_split
+
+    emails = [f"user{i}@domain{i}.com" for i in range(500)]
+    series = pd.Series(emails, name="email")
+    spec = detect_email_split(series, max_dict_size=10)
+    assert spec is None, "Expected None when too many distinct domains"
+
+
+def test_email_split_skips_non_emails():
+    """Si <95% des valeurs sont des emails, on retourne None.
+    """
+    from src.pattern_detector import detect_email_split
+
+    values = [f"user{i}@example.com" for i in range(50)] + [
+        f"not-an-email-{i}" for i in range(50)
+    ]
+    series = pd.Series(values, name="email")
+    spec = detect_email_split(series)
+    assert spec is None, "Expected None when match_ratio < 0.95"
+
+
+def test_build_patterns_emits_email_split():
+    """build_patterns doit emettre un Pattern EMAIL_SPLIT pour une colonne email
+    avec peu de domaines distincts.
+    """
+    from src.pattern_detector import build_patterns
+
+    emails = [f"user{i}@example.com" for i in range(500)]
+    df = pd.DataFrame({"email": emails, "name": ["alice", "bob"] * 250})
+    profiles = [
+        _make_profile("email", ColumnType.STRING, df["email"], is_anchor_candidate=True),
+        _make_profile("name", ColumnType.CATEGORICAL, df["name"]),
+    ]
+    patterns = build_patterns(df, profiles, anchor_columns=["email"])
+    by_col = {p.column: p for p in patterns}
+
+    assert by_col["email"].pattern_type == PatternType.EMAIL_SPLIT, (
+        f"email should be EMAIL_SPLIT, got {by_col['email'].pattern_type}"
+    )
+    assert by_col["email"].format_spec is not None
+    assert by_col["email"].format_spec["separator"] == "@"
+    assert by_col["email"].format_spec["domain_dict"] == ["example.com"]

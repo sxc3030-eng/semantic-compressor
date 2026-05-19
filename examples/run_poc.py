@@ -118,6 +118,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--profile-report", action="store_true",
+        help=(
+            "Genere un rapport HTML d'exploration ydata-profiling "
+            "dans output/profiling_reports/<table>.html en plus de la compression."
+        ),
+    )
+    p.add_argument(
+        "--aggressive-uuid", action="store_true",
+        help=(
+            "Force les colonnes UUID v4 dont le nom ressemble a un id (id, uuid, "
+            "*_id, *_uuid, ...) a etre RANDOM_FORMAT. Gain typique : ~3-5x sur "
+            "ces colonnes au prix de la preservation de la valeur exacte. "
+            "Defaut : preserver les ids comme ANCHOR_DIRECT."
+        ),
+    )
+    p.add_argument(
         "--verbose", action="store_true",
         help="Logging niveau DEBUG.",
     )
@@ -160,12 +176,23 @@ def main() -> int:
         manual_random_format_columns=random_format,
         parquet_codec=args.codec,
         parquet_compression_level=args.level,
-        generate_html_profile=False,
+        generate_html_profile=args.profile_report,
+        aggressive_uuid=args.aggressive_uuid,
     )
     console.print(
         f"  -> recipe={cresult.recipe_path.name} ({cresult.recipe_size_bytes:,} B)"
         f", anchors={cresult.anchor_path.name} ({cresult.anchor_size_bytes:,} B)"
     )
+    if args.profile_report:
+        if cresult.html_profile_path is not None:
+            console.print(
+                f"  -> HTML profile: [cyan]{cresult.html_profile_path}[/cyan]"
+            )
+        else:
+            console.print(
+                "  -> [yellow]HTML profile generation failed[/yellow] "
+                "(voir logs ; le pipeline a continue)"
+            )
 
     # 2. DECOMPRESS
     console.print("\n[bold]Step 2 / 3 : decompress[/bold]")

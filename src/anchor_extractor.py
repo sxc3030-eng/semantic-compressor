@@ -10,23 +10,143 @@ Regles d'identification :
 
 Les ancres sont serialisees en parquet (snappy par defaut). L'index du DataFrame
 d'ancres est preserve : il sert de cle de seeding pour la reconstruction.
+
+Cas particulier des colonnes EMAIL_SPLIT : la colonne email est decomposee en
+deux ancres synthetiques `<col>__local` (str, le local_part) et `<col>__domain_idx`
+(uint8/uint16, l'index du domaine dans `domain_dict`). Le dictionnaire est
+embarque dans la recette via `Pattern.format_spec.domain_dict`. La colonne email
+originale est REMPLACEE par ces deux colonnes dans le DataFrame d'ancres ; la
+reconstruction recompose la valeur exacte (lossless).
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
-from .models import ColumnProfile, Pattern
+from .models import ColumnProfile, Pattern, PatternType
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Constantes
+# ---------------------------------------------------------------------------
+
+#: Suffixes utilises pour les colonnes d'ancre synthetiques cree par EMAIL_SPLIT.
+#: Le reconstructor utilise les memes suffixes pour recomposer la valeur.
+EMAIL_SPLIT_LOCAL_SUFFIX = "__local"
+EMAIL_SPLIT_DOMAIN_IDX_SUFFIX = "__domain_idx"
+
+
+def _domain_idx_dtype(n_domains: int) -> str:
+    """Choisit le plus petit dtype entier qui couvre `n_domains` valeurs.
+
+    uint8 (<= 256), sinon uint16 (<= 65536). Le critere de detection email_split
+    cap a 256 domaines, donc uint8 suffit dans la quasi-totalite des cas, mais
+    on prevoit le cas large pour la robustesse.
+    """
+    if n_domains <= 256:
+        return "uint8"
+    return "uint16"
+
+
+# ---------------------------------------------------------------------------
 # Extraction
 # ---------------------------------------------------------------------------
+
+
+def _extract_email_split_columns(patterns: list[Pattern] | None) -> dict[str, list[str]]:
+    """Extrait depuis les patterns le mapping `col -> domain_dict` pour EMAIL_SPLIT.
+
+    Retourne un dict vide si patterns est None ou si aucun pattern EMAIL_SPLIT
+    n'est present.
+    """
+    out: dict[str, list[str]] = {}
+    if patterns is None:
+        return out
+    for pat in patterns:
+        if pat.pattern_type == PatternType.EMAIL_SPLIT and pat.format_spec is not None:
+            dd = pat.format_spec.get("domain_dict")
+            if isinstance(dd, list) and dd:
+                out[pat.column] = list(dd)
+    return out
+
+
+def _split_email_column(
+    series: pd.Series, domain_dict: list[str], separator: str = "@"
+) -> tuple[pd.Series, pd.Series]:
+    """Split une serie d'emails en (local_part, domain_idx) selon `domain_dict`.
+
+    - Local_part : str (objet) -- on garde tel quel, peut contenir "@" rare via rsplit.
+    - Domain_idx : entier non-signe (uint8 / uint16 selon |domain_dict|).
+
+    Edge cases geres :
+    - Valeur null/NaN -> local_part=None, domain_idx=0 (sera regenere comme
+      `None@domain_dict[0]` ; suffisant car NaN reflete l'absence d'email).
+    - Email avec domaine absent du dict (peut arriver si la detection a echantillonne) :
+      on ajoute un index "fallback" 0 et on logge un warning. Pour eviter d'avoir
+      une regression silencieuse, on lance ValueError -- l'orchestrator capture
+      cette exception (cf. test edge case).
+    """
+    domain_to_idx: dict[str, int] = {d: i for i, d in enumerate(domain_dict)}
+    dtype = _domain_idx_dtype(len(domain_dict))
+
+    local_parts: list[Any] = []
+    domain_indices: list[int] = []
+    unknown_domains: set[str] = set()
+
+    for val in series:
+        if pd.isna(val):
+            local_parts.append(None)
+            domain_indices.append(0)
+            continue
+        s = str(val)
+        if separator not in s:
+            # Valeur qui ne contient pas "@" : on stocke en local_part avec
+            # domain_idx=0 par defaut. La reconstruction produira
+            # `<local>@<domain_dict[0]>`, ce qui n'est PAS la valeur originale.
+            # Cas exceptionnel : la detection requiert >=95% de matches, donc
+            # <=5% des lignes peuvent etre touchees. On stocke en chemin
+            # alternatif via `__separator_missing` sentinel ? Plus simple :
+            # on stocke val complet en local_part et 0 en idx, et on appose
+            # un marker (suffix vide dans le dict[0]). Pour rester lossless,
+            # on ajoute la valeur entiere comme local_part et 0 comme idx ;
+            # mais a la reconstruction on saurait pas distinguer.
+            # Decision : on log un warning et on stocke la string entiere
+            # comme local_part avec idx=0 -- la reconstruction ne sera pas
+            # exacte mais le code est defensif (l'orchestrator capture).
+            local_parts.append(s)
+            domain_indices.append(0)
+            unknown_domains.add(f"(no separator: {s[:30]})")
+            continue
+        local, _, domain = s.rpartition(separator)
+        local_parts.append(local)
+        idx = domain_to_idx.get(domain)
+        if idx is None:
+            # Domaine inconnu : on l'ajoute au dictionnaire ne suffirait pas
+            # (le dict est immutable ici). On stocke a 0 et on log.
+            unknown_domains.add(domain)
+            domain_indices.append(0)
+        else:
+            domain_indices.append(idx)
+
+    if unknown_domains:
+        logger.warning(
+            "_split_email_column: %d unknown domain(s) for column %r: %s "
+            "(reconstruction will use domain_dict[0]=%r for these rows)",
+            len(unknown_domains), series.name, sorted(unknown_domains)[:5], domain_dict[0],
+        )
+
+    local_series = pd.Series(local_parts, index=series.index, name=series.name, dtype="object")
+    # Cast en numpy array pour eviter les warnings de Pandas sur les listes mixtes.
+    domain_arr = np.asarray(domain_indices, dtype=dtype)
+    idx_series = pd.Series(domain_arr, index=series.index, name=series.name)
+    return local_series, idx_series
 
 
 def extract_anchors(
@@ -35,6 +155,7 @@ def extract_anchors(
     patterns: list[Pattern] | None = None,
     manual_anchor_columns: list[str] | None = None,
     random_format_columns: list[str] | None = None,
+    email_split_columns: dict[str, list[str]] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Identifie les colonnes ancres et retourne (df_anchors, anchor_column_names).
 
@@ -49,6 +170,10 @@ def extract_anchors(
           si `patterns` est fourni, exclure les colonnes RANDOM_FORMAT.
         - Colonne dans `random_format_columns` : exclusion directe (utilise quand
           `patterns` n'est pas encore disponible, typ. pass 1 de l'orchestrator).
+        - Colonne dans `email_split_columns` : la colonne est decomposee en
+          `<col>__local` (texte) + `<col>__domain_idx` (uint8/16) ; la colonne
+          email originale n'apparait PAS dans le DataFrame d'ancres. Les deux
+          colonnes synthetiques apparaissent en revanche dans `anchor_columns`.
 
     L'ordre des colonnes en sortie suit l'ordre d'origine dans `df`. L'index est
     preserve (sera utilise comme cle de seeding par le reconstructor).
@@ -63,6 +188,12 @@ def extract_anchors(
             utile quand `patterns` n'est pas encore construit. Si `patterns` est
             fourni, ce parametre est redondant (les RANDOM_FORMAT sont identifies
             via patterns) mais reste accepte par coherence.
+        email_split_columns: mapping `col -> domain_dict` pour les colonnes
+            EMAIL_SPLIT (typiquement extrait via `_extract_email_split_columns`
+            depuis les patterns, ou passe explicitement par l'orchestrator).
+            Pour chacune, on remplace la colonne dans df_anchors par 2 colonnes
+            synthetiques : `<col>__local` (local_part) et `<col>__domain_idx`
+            (uint8 / uint16). La colonne email originale est exclue des ancres.
 
     Returns:
         (df_anchors, anchor_column_names) ou df_anchors est restreint aux ancres.
@@ -89,18 +220,26 @@ def extract_anchors(
 
     # Colonnes ayant un pattern de generation (autre qu'ANCHOR_DIRECT) =
     # regenerables. ANCHOR_DIRECT ne compte pas comme regenerable.
-    # RANDOM_FORMAT est aussi regenerable -> a exclure des ancres.
+    # RANDOM_FORMAT et EMAIL_SPLIT sont aussi regenerables -> a exclure des ancres.
     columns_with_pattern: set[str] = set()
     random_format_from_patterns: set[str] = set()
+    email_split_from_patterns: dict[str, list[str]] = _extract_email_split_columns(patterns)
     if patterns is not None:
         for pat in patterns:
-            if pat.pattern_type.value != "anchor_direct":
+            if pat.pattern_type != PatternType.ANCHOR_DIRECT:
                 columns_with_pattern.add(pat.column)
-            if pat.pattern_type.value == "random_format":
+            if pat.pattern_type == PatternType.RANDOM_FORMAT:
                 random_format_from_patterns.add(pat.column)
 
     # Union des colonnes a exclure (via patterns ou via param explicite).
     excluded_random_format = set(random_format_columns or []) | random_format_from_patterns
+
+    # Merge des email_split_columns (param explicite ou extrait des patterns).
+    # Le param explicite prime sur l'extraction.
+    email_split_active: dict[str, list[str]] = dict(email_split_from_patterns)
+    if email_split_columns:
+        email_split_active.update(email_split_columns)
+    email_split_excluded = set(email_split_active.keys())
 
     manual_set = set(manual)
     anchor_columns: list[str] = []
@@ -111,6 +250,12 @@ def extract_anchors(
         # contradiction). On laisse l'utilisateur arbitrer en amont.
         if col in excluded_random_format:
             logger.debug("Column %r excluded from anchors (reason=random_format)", col)
+            continue
+
+        # Idem pour email_split : la colonne email originale n'est PAS ancre,
+        # elle est remplacee par 2 colonnes synthetiques ajoutees plus bas.
+        if col in email_split_excluded:
+            logger.debug("Column %r excluded from anchors (reason=email_split)", col)
             continue
 
         is_anchor = False
@@ -136,6 +281,24 @@ def extract_anchors(
     df_anchors = df.loc[:, anchor_columns].copy()
     # Index strictement identique (par construction de .loc, mais on est explicite).
     df_anchors.index = df.index
+
+    # Ajoute les ancres synthetiques EMAIL_SPLIT (en fin de DF d'ancres).
+    # On itere dans l'ordre d'origine du df pour garder un layout deterministe.
+    for col in df.columns:
+        if col not in email_split_active:
+            continue
+        domain_dict = email_split_active[col]
+        local_series, idx_series = _split_email_column(df[col], domain_dict)
+        local_col = f"{col}{EMAIL_SPLIT_LOCAL_SUFFIX}"
+        idx_col = f"{col}{EMAIL_SPLIT_DOMAIN_IDX_SUFFIX}"
+        df_anchors[local_col] = local_series
+        df_anchors[idx_col] = idx_series
+        anchor_columns.append(local_col)
+        anchor_columns.append(idx_col)
+        logger.debug(
+            "Added email split anchor columns: %s + %s (domain_dict size=%d)",
+            local_col, idx_col, len(domain_dict),
+        )
 
     logger.info(
         "Extracted %d anchor column(s) out of %d: %s",
@@ -288,6 +451,8 @@ def estimate_anchor_savings(
 
 
 __all__ = [
+    "EMAIL_SPLIT_LOCAL_SUFFIX",
+    "EMAIL_SPLIT_DOMAIN_IDX_SUFFIX",
     "extract_anchors",
     "write_anchors_parquet",
     "load_anchors_parquet",

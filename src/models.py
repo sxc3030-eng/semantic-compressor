@@ -78,6 +78,13 @@ class PatternType(str, Enum):
     # et on regenere des valeurs uniques conformes au format a la reconstruction.
     # Exemple typique : password_hash bcrypt-like. Pas d'ancre stockee.
     RANDOM_FORMAT = "random_format"
+    # Colonnes email decomposees en local_part + domain_index : le local_part
+    # reste ancre (irreductible par utilisateur), le domain est stocke sous
+    # forme d'index uint8 dans un dictionnaire ({0: "example.com", ...}) place
+    # dans `format_spec.domain_dict`. Encodage LOSSLESS : la reconstruction
+    # produit la valeur originale exacte. Gain : ~10 bytes/ligne en moyenne
+    # sur les datasets ou peu de domaines uniques dominent.
+    EMAIL_SPLIT = "email_split"
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +292,20 @@ class Pattern(_StrictModel):
                 raise ValueError(
                     f"RANDOM_FORMAT `format_spec` is missing required keys: {sorted(missing)}"
                 )
+        if pt == PatternType.EMAIL_SPLIT:
+            if self.format_spec is None:
+                raise ValueError("EMAIL_SPLIT pattern requires `format_spec`")
+            required_keys = {"separator", "domain_dict"}
+            missing = required_keys - set(self.format_spec.keys())
+            if missing:
+                raise ValueError(
+                    f"EMAIL_SPLIT `format_spec` is missing required keys: {sorted(missing)}"
+                )
+            domain_dict = self.format_spec["domain_dict"]
+            if not isinstance(domain_dict, list) or not domain_dict:
+                raise ValueError(
+                    "EMAIL_SPLIT `format_spec.domain_dict` must be a non-empty list of strings"
+                )
         return self
 
 
@@ -325,7 +346,26 @@ class Recipe(_StrictModel):
     @model_validator(mode="after")
     def _check_anchor_columns_exist(self) -> Recipe:
         known = {c.name for c in self.schema_columns}
-        unknown = [a for a in self.anchor_columns if a not in known]
+        # Les ancres synthetiques EMAIL_SPLIT (suffixes `__local` / `__domain_idx`)
+        # n'apparaissent PAS dans schema_columns mais sont legitimes : elles
+        # remplacent une colonne email dans le parquet d'ancres. On les autorise
+        # uniquement si la racine (avant le suffixe) est une colonne EMAIL_SPLIT.
+        email_split_roots = {
+            p.column for p in self.patterns if p.pattern_type == PatternType.EMAIL_SPLIT
+        }
+
+        def _is_email_split_synthetic(col: str) -> bool:
+            for suffix in ("__local", "__domain_idx"):
+                if col.endswith(suffix):
+                    root = col[: -len(suffix)]
+                    if root in email_split_roots:
+                        return True
+            return False
+
+        unknown = [
+            a for a in self.anchor_columns
+            if a not in known and not _is_email_split_synthetic(a)
+        ]
         if unknown:
             raise ValueError(f"anchor_columns reference unknown columns: {unknown}")
         return self

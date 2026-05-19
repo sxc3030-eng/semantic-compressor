@@ -38,7 +38,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .anchor_extractor import load_anchors_parquet
+from .anchor_extractor import (
+    EMAIL_SPLIT_DOMAIN_IDX_SUFFIX,
+    EMAIL_SPLIT_LOCAL_SUFFIX,
+    load_anchors_parquet,
+)
 from .models import (
     ColumnProfile,
     ColumnType,
@@ -649,6 +653,32 @@ def _apply_pattern(
 
     if pt == PatternType.ANCHOR_DIRECT:
         return anchor_row.get(col)
+
+    if pt == PatternType.EMAIL_SPLIT:
+        if pattern.format_spec is None:  # pragma: no cover - garantie par le model_validator
+            raise ValueError(f"EMAIL_SPLIT pattern for {col} missing `format_spec`")
+        domain_dict = pattern.format_spec.get("domain_dict") or []
+        separator = pattern.format_spec.get("separator", "@")
+        local_col = f"{col}{EMAIL_SPLIT_LOCAL_SUFFIX}"
+        idx_col = f"{col}{EMAIL_SPLIT_DOMAIN_IDX_SUFFIX}"
+        local_part = anchor_row.get(local_col)
+        idx_value = anchor_row.get(idx_col)
+        if local_part is None or idx_value is None:
+            # Edge case : ancre manquante. On retourne None (NaN apres re-cast pandas).
+            return None
+        try:
+            idx_int = int(idx_value)
+        except (TypeError, ValueError):
+            idx_int = 0
+        if idx_int < 0 or idx_int >= len(domain_dict):
+            # Index hors-bornes : on retombe sur le 1er domaine du dict pour rester defensif.
+            logger.warning(
+                "EMAIL_SPLIT for %r: domain_idx=%d out of bounds (dict size=%d), using index 0",
+                col, idx_int, len(domain_dict),
+            )
+            idx_int = 0
+        domain = domain_dict[idx_int]
+        return f"{local_part}{separator}{domain}"
 
     if pt == PatternType.RANDOM_FORMAT:
         if pattern.format_spec is None:  # pragma: no cover - garantie par le model_validator

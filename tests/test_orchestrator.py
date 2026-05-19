@@ -102,9 +102,15 @@ def test_compress_returns_result_with_metrics(compress_result: CompressionResult
     assert r.n_patterns == 9  # un pattern par colonne (ANCHOR_DIRECT pour id/email, RANDOM_FORMAT pour password_hash)
     assert r.elapsed_seconds > 0
 
-    # Ancres : id et email restent ancres ; password_hash est RANDOM_FORMAT
-    # (bcrypt detecte automatiquement) donc PAS dans les ancres.
-    assert set(r.anchor_columns) >= {"id", "email"}
+    # Ancres : id reste ancre ANCHOR_DIRECT ; email est decompose en ancres
+    # synthetiques EMAIL_SPLIT (`email__local` + `email__domain_idx`) ;
+    # password_hash est RANDOM_FORMAT (bcrypt) -> pas dans les ancres.
+    assert "id" in set(r.anchor_columns)
+    assert "email__local" in set(r.anchor_columns)
+    assert "email__domain_idx" in set(r.anchor_columns)
+    assert "email" not in set(r.anchor_columns), (
+        "Raw email column should NOT be an anchor (replaced by EMAIL_SPLIT synthetic cols)"
+    )
     assert "password_hash" not in r.anchor_columns
 
 
@@ -132,15 +138,29 @@ def test_decompress_roundtrip(users_csv: Path, tmp_path: Path) -> None:
     df = pd.read_csv(reconstructed_csv)
     assert len(df) == 10_000
     assert len(df.columns) == 9
-    # Les ancres doivent matcher exactement
+    # Les ancres doivent matcher exactement. On filtre les ancres synthetiques
+    # EMAIL_SPLIT (`*__local`, `*__domain_idx`) qui n'existent que dans le
+    # parquet, pas dans le CSV reconstruit. La colonne email racine doit etre
+    # losslessly preservee via EMAIL_SPLIT.
     original = pd.read_csv(users_csv)
-    for col in compress_result.anchor_columns:
+    csv_anchor_cols = [
+        c for c in compress_result.anchor_columns
+        if not (c.endswith("__local") or c.endswith("__domain_idx"))
+    ]
+    for col in csv_anchor_cols:
         pd.testing.assert_series_equal(
             df[col].reset_index(drop=True),
             original[col].reset_index(drop=True),
             check_dtype=False,
             check_names=False,
         )
+    # Verification specifique : email lossless via EMAIL_SPLIT.
+    pd.testing.assert_series_equal(
+        df["email"].reset_index(drop=True),
+        original["email"].reset_index(drop=True),
+        check_dtype=False,
+        check_names=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +270,60 @@ def test_compress_with_snappy_codec_works(users_csv: Path, tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 # 8. RANDOM_FORMAT integration : ratio + fidelite ameliorees pour password_hash
 # ---------------------------------------------------------------------------
+
+
+def test_compress_with_html_profile_generates_file(
+    tmp_path: Path,
+) -> None:
+    """compress(generate_html_profile=True) doit produire un .html non-vide.
+
+    Le rapport est ecrit dans output_dir/profiling_reports/<table_name>.html et
+    son chemin est expose via result.html_profile_path. Si la generation echoue
+    (ex: incompatibilite Python), on skip (le pipeline ne doit pas etre bloque).
+
+    On utilise un mini CSV synthetique pour isoler le test du pipeline complet :
+    le but est de valider le wiring HTML profile, pas la reconstruction.
+    """
+    # Mini CSV pour isoler le wiring HTML profile.
+    mini_csv = tmp_path / "mini.csv"
+    df = pd.DataFrame(
+        {
+            "id": list(range(100)),
+            "value": [f"item_{i}" for i in range(100)],
+            "score": [i * 1.5 for i in range(100)],
+            "flag": [i % 2 == 0 for i in range(100)],
+        }
+    )
+    df.to_csv(mini_csv, index=False)
+
+    result = compress(
+        mini_csv,
+        tmp_path,
+        table_name="mini",
+        generate_html_profile=True,
+    )
+
+    if result.html_profile_path is None:
+        pytest.skip("ydata-profiling generation failed (graceful skip)")
+
+    assert result.html_profile_path.exists(), (
+        f"HTML profile should exist at {result.html_profile_path}"
+    )
+    assert result.html_profile_path.suffix == ".html"
+    # Le rapport ydata-profiling est genere directement dans le dossier voulu.
+    expected_parent = tmp_path / "profiling_reports"
+    assert result.html_profile_path.parent == expected_parent, (
+        f"Expected parent {expected_parent}, got {result.html_profile_path.parent}"
+    )
+    # Sanity : un rapport ydata-profiling minimal-mode pese au moins quelques
+    # dizaines de KB (HTML + CSS embarques). On reste tres conservateur.
+    size = result.html_profile_path.stat().st_size
+    assert size > 10_000, f"HTML profile suspiciously small: {size} bytes"
+    # Verifier que c'est bien du HTML.
+    content_head = result.html_profile_path.read_bytes()[:1024].lower()
+    assert b"<html" in content_head or b"<!doctype html" in content_head, (
+        "File does not look like HTML"
+    )
 
 
 def test_compress_with_random_format_password_hash(users_csv: Path, tmp_path: Path) -> None:

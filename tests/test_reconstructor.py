@@ -513,10 +513,20 @@ def test_end_to_end_users_csv(tmp_path: Path) -> None:
 
     assert len(reconstructed) == 10_000, f"expected 10000 rows, got {len(reconstructed)}"
     assert set(reconstructed.columns) == set(df.columns)
-    # Anchor columns identiques (id, email, password_hash).
+    # Anchor columns identiques. On filtre les ancres synthetiques EMAIL_SPLIT
+    # (`*__local`, `*__domain_idx`) qui n'existent que dans le parquet d'ancres,
+    # pas dans le CSV reconstruit. On compare a la place la colonne email
+    # racine, qui doit etre losslessly identique.
     for col in recipe_obj.anchor_columns:
+        if col.endswith("__local") or col.endswith("__domain_idx"):
+            continue
         assert (reconstructed[col].reset_index(drop=True) == df[col].reset_index(drop=True)).all(), (
             f"anchor column {col} differs from original"
+        )
+    # Verification explicite que la colonne email (EMAIL_SPLIT) est lossless.
+    if "email" in df.columns:
+        assert (reconstructed["email"].reset_index(drop=True) == df["email"].reset_index(drop=True)).all(), (
+            "email column should be losslessly reconstructed via EMAIL_SPLIT"
         )
     # Age borne [18, 99].
     age_min, age_max = reconstructed["age"].min(), reconstructed["age"].max()
@@ -678,3 +688,83 @@ def test_reconstruct_with_random_format_pattern() -> None:
     for v in df["password_hash"]:
         assert pat.match(v), f"Generated value {v!r} does not match regex"
     assert df["password_hash"].nunique() == n
+
+
+# ---------------------------------------------------------------------------
+# EMAIL_SPLIT roundtrip
+# ---------------------------------------------------------------------------
+
+
+def test_email_split_roundtrip() -> None:
+    """EMAIL_SPLIT : split + reconstruct doit produire EXACTEMENT l'email d'origine.
+
+    Verifie le contrat lossless : le split decompose en (local_part, domain_idx),
+    la reconstruction recompose `local + '@' + domain_dict[idx]`. Aucune valeur
+    ne doit etre perdue ou modifiee.
+    """
+    from src.anchor_extractor import (
+        EMAIL_SPLIT_DOMAIN_IDX_SUFFIX,
+        EMAIL_SPLIT_LOCAL_SUFFIX,
+        extract_anchors,
+    )
+    from src.pattern_detector import build_patterns
+
+    rng = np.random.default_rng(0)
+    domains = ["example.com", "example.net", "example.org"]
+    emails = [
+        f"user_{i}_alpha@{rng.choice(domains)}" for i in range(200)
+    ]
+    df = pd.DataFrame({
+        "id": [f"u{i:04d}" for i in range(200)],
+        "email": emails,
+        "country": ["US", "FR"] * 100,
+    })
+    profiles = [
+        ColumnProfile(
+            name="id", column_type=ColumnType.STRING, dtype="object",
+            n_total=200, n_unique=200, n_null=0, is_anchor_candidate=True,
+        ),
+        ColumnProfile(
+            name="email", column_type=ColumnType.STRING, dtype="object",
+            n_total=200, n_unique=200, n_null=0, is_anchor_candidate=True,
+        ),
+        ColumnProfile(
+            name="country", column_type=ColumnType.CATEGORICAL, dtype="object",
+            n_total=200, n_unique=2, n_null=0, is_anchor_candidate=False,
+        ),
+    ]
+
+    patterns = build_patterns(df, profiles, anchor_columns=["id", "email"])
+    by_col = {p.column: p for p in patterns}
+    assert by_col["email"].pattern_type == PatternType.EMAIL_SPLIT
+    email_domain_dict = by_col["email"].format_spec["domain_dict"]
+    assert set(email_domain_dict) == set(domains)
+
+    df_anchors, anchor_cols = extract_anchors(df, profiles, patterns=patterns)
+    # Verifie que les colonnes synthetiques EMAIL_SPLIT sont presentes.
+    assert f"email{EMAIL_SPLIT_LOCAL_SUFFIX}" in anchor_cols
+    assert f"email{EMAIL_SPLIT_DOMAIN_IDX_SUFFIX}" in anchor_cols
+    assert "email" not in anchor_cols, "Raw email column should not be an anchor"
+
+    recipe = Recipe(
+        metadata=RecipeMetadata(
+            table_name="test", n_rows=200, original_size_bytes=1000,
+            anchor_size_bytes=500, compression_ratio=2.0,
+        ),
+        schema_columns=profiles,
+        anchor_columns=anchor_cols,
+        anchor_file="x.parquet",
+        patterns=patterns,
+    )
+
+    reconstructed = reconstruct(recipe, df_anchors)
+    # Lossless : la colonne email reconstruite doit etre EXACTEMENT l'originale.
+    assert "email" in reconstructed.columns
+    assert "email__local" not in reconstructed.columns
+    assert "email__domain_idx" not in reconstructed.columns
+    pd.testing.assert_series_equal(
+        reconstructed["email"].reset_index(drop=True),
+        df["email"].reset_index(drop=True),
+        check_dtype=False,
+        check_names=False,
+    )
