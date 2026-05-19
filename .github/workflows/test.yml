@@ -1,0 +1,75 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs of the same workflow on the same branch (saves CI minutes on rapid pushes).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't kill the whole matrix if one Python version fails; we want full signal.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Upgrade pip toolchain
+        run: |
+          python -m pip install --upgrade pip wheel
+
+      - name: Install project dependencies
+        # setuptools<81 is pinned EXPLICITLY here (in addition to requirements.txt) because
+        # ydata-profiling imports pkg_resources at module load, which is removed in setuptools 81+.
+        # On Python 3.13, setuptools is no longer bundled with the stdlib, so a fresh interpreter
+        # may resolve a newer setuptools first via transitive deps. Forcing the constraint up-front
+        # guarantees the import-time crash never happens.
+        run: |
+          python -m pip install "setuptools<81"
+          python -m pip install -r requirements.txt
+          python -m pip install pytest-cov
+
+      - name: Show installed versions (debug aid)
+        run: |
+          python --version
+          python -m pip list
+
+      - name: Run pytest with coverage
+        run: |
+          python -m pytest \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov \
+            --junitxml=pytest-report.xml
+
+      - name: Upload coverage artifact
+        # Only upload once per matrix run; keep artifacts for a week.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+            pytest-report.xml
+          retention-days: 7
+          if-no-files-found: warn
