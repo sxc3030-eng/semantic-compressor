@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now (remplace datetime.utcnow() deprecated en 3.12+)."""
+    return datetime.now(timezone.utc)
 from enum import Enum
 from typing import Any
 
@@ -281,7 +286,7 @@ class RecipeMetadata(_StrictModel):
     recipe_size_bytes: int = Field(default=0, ge=0)
     compression_ratio: float = Field(ge=0.0)
     fidelity_target: float = Field(default=0.95, ge=0.0, le=1.0)
-    generated_at: datetime = Field(default_factory=datetime.utcnow)
+    generated_at: datetime = Field(default_factory=_utcnow)
     seed_strategy: str = "sha256_anchor_id_int32"
     python_version: str | None = Field(default_factory=lambda: sys.version.split()[0])
 
@@ -342,7 +347,7 @@ class ValidationReport(_StrictModel):
     failed_count: int = Field(ge=0)
     structural_tests: list[ValidationTestResult] = Field(default_factory=list)
     statistical_tests: list[ValidationTestResult] = Field(default_factory=list)
-    generated_at: datetime = Field(default_factory=datetime.utcnow)
+    generated_at: datetime = Field(default_factory=_utcnow)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
