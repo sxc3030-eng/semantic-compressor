@@ -21,7 +21,7 @@ setuptools<81
 faker>=22
 
 # Console output (tables, progress bars)
-rich>=13
+rich>=15.0.0
 
 # Testing
 pytest>=8
