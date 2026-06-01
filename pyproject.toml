@@ -19,7 +19,7 @@ dependencies = [
     "scipy>=1.11",
     "ydata-profiling>=4.10",
     "setuptools<81",  # ydata-profiling needs pkg_resources, removed in setuptools 81+
-    "faker>=22",
+    "faker>=40.19.1",
     "rich>=13",
 ]
 
