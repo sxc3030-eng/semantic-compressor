@@ -18,7 +18,7 @@ ydata-profiling>=4.10
 setuptools<81
 
 # Fake data generator for the test database
-faker>=22
+faker>=40.19.1
 
 # Console output (tables, progress bars)
 rich>=13
